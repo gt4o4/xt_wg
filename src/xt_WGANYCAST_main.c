@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * xt_WGANYCAST kernel module
- *
- * Stateless per-packet IP rewriter for UDP, intended to fan a single
- * application's UDP flow across multiple anycast destination IPs without
- * involving conntrack/DNAT. See xt_WGANYCAST.h for protocol semantics.
+ * xt_WGANYCAST kernel module — see xt_WGANYCAST.h for protocol semantics.
  *
  * Use:
  *
- *   # spray WG outbound across two anycast IPs (no conntrack interaction)
- *   iptables -t mangle -A OUTPUT -p udp --dport 51820 -d 161.248.136.186 \
+ *   # spray WG outbound across two anycast IPs (port preserved)
+ *   iptables -t mangle -A OUTPUT -p udp --dport 51821 -d 193.134.211.67 \
  *     -j WGANYCAST --dest 161.248.136.186 --dest 138.252.162.176
  *
+ *   # spray with port rewrite (gateway maps anycast :59263 → backend :51821)
+ *   iptables -t mangle -A OUTPUT -p udp --dport 51821 -d 193.134.211.67 \
+ *     -j WGANYCAST --dest 161.248.136.186:59263 --dest 138.252.162.176:59263
+ *
  *   # canonicalise replies so WG sees a single peer endpoint
- *   iptables -t mangle -A PREROUTING -p udp --sport 51820 \
- *     -s 138.252.162.176 -j WGANYCAST --canonical 161.248.136.186
+ *   iptables -t mangle -A PREROUTING -p udp --sport 59263 -s 138.252.162.176 \
+ *     -j WGANYCAST --canonical 193.134.211.67:51821
  */
 
 #include <linux/version.h>
@@ -35,6 +35,7 @@ static unsigned int wganycast_target(struct sk_buff *skb,
 	struct iphdr *iph;
 	struct udphdr *udph;
 	__be32 old_addr, new_addr;
+	__be16 old_port, new_port;
 	unsigned int idx;
 
 	if (skb_ensure_writable(skb, skb_network_offset(skb) + sizeof(*iph) +
@@ -53,36 +54,52 @@ static unsigned int wganycast_target(struct sk_buff *skb,
 	if (info->mode == XT_WGANYCAST_MODE_SPRAY) {
 		if (info->ndests == 0)
 			return XT_CONTINUE;
-
 		/* Uniform random per-packet selection. Stateless — no
 		 * per-rule counter to coordinate across CPUs.
 		 */
 		idx = get_random_u32() % info->ndests;
+		new_addr = info->dests[idx].ip;
+		new_port = info->dests[idx].port;
 		old_addr = iph->daddr;
-		new_addr = info->dests[idx];
-		if (new_addr == old_addr)
-			return XT_CONTINUE;
-		iph->daddr = new_addr;
-	} else if (info->mode == XT_WGANYCAST_MODE_CANONICAL) {
-		old_addr = iph->saddr;
-		new_addr = info->dests[0];
-		if (new_addr == old_addr)
-			return XT_CONTINUE;
-		iph->saddr = new_addr;
-	} else {
-		return XT_CONTINUE;
-	}
+		old_port = udph->dest;
 
-	/* Incremental checksum updates — both IP and UDP carry the
-	 * rewritten address in their pseudo-header / header. UDP checksum
-	 * may be 0 (disabled) on the outbound path — leave it alone in
-	 * that case; the wire is allowed to have udph->check == 0 for
-	 * IPv4 UDP.
-	 */
-	csum_replace4(&iph->check, old_addr, new_addr);
-	if (udph->check)
-		inet_proto_csum_replace4(&udph->check, skb, old_addr, new_addr,
-					 true);
+		if (new_addr != old_addr) {
+			iph->daddr = new_addr;
+			csum_replace4(&iph->check, old_addr, new_addr);
+			if (udph->check)
+				inet_proto_csum_replace4(&udph->check, skb,
+							 old_addr, new_addr,
+							 true);
+		}
+		if (new_port && new_port != old_port) {
+			udph->dest = new_port;
+			if (udph->check)
+				inet_proto_csum_replace2(&udph->check, skb,
+							 old_port, new_port,
+							 false);
+		}
+	} else if (info->mode == XT_WGANYCAST_MODE_CANONICAL) {
+		new_addr = info->dests[0].ip;
+		new_port = info->dests[0].port;
+		old_addr = iph->saddr;
+		old_port = udph->source;
+
+		if (new_addr != old_addr) {
+			iph->saddr = new_addr;
+			csum_replace4(&iph->check, old_addr, new_addr);
+			if (udph->check)
+				inet_proto_csum_replace4(&udph->check, skb,
+							 old_addr, new_addr,
+							 true);
+		}
+		if (new_port && new_port != old_port) {
+			udph->source = new_port;
+			if (udph->check)
+				inet_proto_csum_replace2(&udph->check, skb,
+							 old_port, new_port,
+							 false);
+		}
+	}
 
 	return XT_CONTINUE;
 }

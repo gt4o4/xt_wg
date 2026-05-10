@@ -3,9 +3,9 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <getopt.h>
-#include <stdlib.h>
 #include <arpa/inet.h>
 #include <xtables.h>
 #include "xt_WGANYCAST.h"
@@ -32,15 +32,48 @@ static const struct option wganycast_opts[] = {
 static void wganycast_help(void)
 {
 	printf("WGANYCAST target options:\n"
-	       "    --dest <ip>          spray packets to this IP (repeat for pool, max %d)\n"
-	       "    --canonical <ip>     rewrite source IP to <ip>\n"
+	       "    --dest <ip>[:<port>]      spray packets to this IP[:port]\n"
+	       "                              (repeat for pool, max %d entries)\n"
+	       "    --canonical <ip>[:<port>] rewrite source IP[:port] to this\n"
 	       "\n"
-	       "  --dest is for OUTPUT/POSTROUTING (per-packet random destination\n"
-	       "  selection across the pool). --canonical is for PREROUTING\n"
-	       "  (canonicalise replies from any anycast IP back to a single\n"
-	       "  source so WireGuard roaming stays pinned). The two flags are\n"
-	       "  mutually exclusive.\n",
+	       "  Port is optional; when omitted, the packet's existing port is\n"
+	       "  preserved. --dest is for OUTPUT/POSTROUTING (per-packet random\n"
+	       "  destination selection across the pool). --canonical is for\n"
+	       "  PREROUTING (canonicalise replies from any anycast IP back to a\n"
+	       "  single source so WireGuard roaming stays pinned). The two flags\n"
+	       "  are mutually exclusive.\n",
 	       XT_WGANYCAST_MAX_DESTS);
+}
+
+/* Parse "IP" or "IP:PORT" into (addr, port). Returns 0 on success, -1 on
+ * bad format. port_out is set to 0 (network-order) when no :port given.
+ */
+static int parse_addr_port(const char *s, struct in_addr *addr_out,
+			   __be16 *port_out)
+{
+	char buf[64];
+	char *colon;
+	unsigned long p;
+
+	if (strlen(s) >= sizeof(buf))
+		return -1;
+	strncpy(buf, s, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+
+	colon = strrchr(buf, ':');
+	if (colon) {
+		*colon = '\0';
+		p = strtoul(colon + 1, NULL, 10);
+		if (p == 0 || p > 65535)
+			return -1;
+		*port_out = htons((uint16_t)p);
+	} else {
+		*port_out = 0;
+	}
+
+	if (!inet_aton(buf, addr_out))
+		return -1;
+	return 0;
 }
 
 static int wganycast_parse(int c, char **argv, int invert, unsigned int *flags,
@@ -48,6 +81,7 @@ static int wganycast_parse(int c, char **argv, int invert, unsigned int *flags,
 {
 	struct xt_wganycast_info *info = (void *)(*tgt)->data;
 	struct in_addr addr;
+	__be16 port;
 
 	switch (c) {
 	case OPT_DEST:
@@ -58,11 +92,14 @@ static int wganycast_parse(int c, char **argv, int invert, unsigned int *flags,
 			xtables_error(PARAMETER_PROBLEM,
 				"WGANYCAST: too many --dest entries (max %d)",
 				XT_WGANYCAST_MAX_DESTS);
-		if (!inet_aton(optarg, &addr))
+		if (parse_addr_port(optarg, &addr, &port) < 0)
 			xtables_error(PARAMETER_PROBLEM,
-				"WGANYCAST: bad --dest address: %s", optarg);
+				"WGANYCAST: bad --dest \"%s\" (expected IP or IP:PORT)",
+				optarg);
 		info->mode = XT_WGANYCAST_MODE_SPRAY;
-		info->dests[info->ndests++] = addr.s_addr;
+		info->dests[info->ndests].ip = addr.s_addr;
+		info->dests[info->ndests].port = port;
+		info->ndests++;
 		*flags |= F_SPRAY;
 		return true;
 
@@ -73,11 +110,13 @@ static int wganycast_parse(int c, char **argv, int invert, unsigned int *flags,
 		if (*flags & F_CANONICAL)
 			xtables_error(PARAMETER_PROBLEM,
 				"WGANYCAST: --canonical can only be specified once");
-		if (!inet_aton(optarg, &addr))
+		if (parse_addr_port(optarg, &addr, &port) < 0)
 			xtables_error(PARAMETER_PROBLEM,
-				"WGANYCAST: bad --canonical address: %s", optarg);
+				"WGANYCAST: bad --canonical \"%s\" (expected IP or IP:PORT)",
+				optarg);
 		info->mode = XT_WGANYCAST_MODE_CANONICAL;
-		info->dests[0] = addr.s_addr;
+		info->dests[0].ip = addr.s_addr;
+		info->dests[0].port = port;
 		info->ndests = 1;
 		*flags |= F_CANONICAL;
 		return true;
@@ -93,24 +132,28 @@ static void wganycast_check(unsigned int flags)
 			"WGANYCAST: --dest or --canonical is required");
 }
 
+static void print_dest(const struct xt_wganycast_dest *d, const char *opt)
+{
+	char buf[INET_ADDRSTRLEN];
+	struct in_addr a = { .s_addr = d->ip };
+	inet_ntop(AF_INET, &a, buf, sizeof(buf));
+	if (d->port)
+		printf(" %s %s:%u", opt, buf, ntohs(d->port));
+	else
+		printf(" %s %s", opt, buf);
+}
+
 static void wganycast_print(const void *entry,
 			    const struct xt_entry_target *tgt, int numeric)
 {
 	const struct xt_wganycast_info *info = (const void *)tgt->data;
-	char buf[INET_ADDRSTRLEN];
-	struct in_addr a;
 	int i;
 
 	if (info->mode == XT_WGANYCAST_MODE_SPRAY) {
-		for (i = 0; i < info->ndests; i++) {
-			a.s_addr = info->dests[i];
-			inet_ntop(AF_INET, &a, buf, sizeof(buf));
-			printf(" --dest %s", buf);
-		}
+		for (i = 0; i < info->ndests; i++)
+			print_dest(&info->dests[i], "--dest");
 	} else if (info->mode == XT_WGANYCAST_MODE_CANONICAL) {
-		a.s_addr = info->dests[0];
-		inet_ntop(AF_INET, &a, buf, sizeof(buf));
-		printf(" --canonical %s", buf);
+		print_dest(&info->dests[0], "--canonical");
 	}
 }
 
