@@ -15,6 +15,14 @@ enum {
 	OPT_CANONICAL,
 };
 
+/* `*flags` bits — tracked per-invocation in xtables_target.parse() so we
+ * can detect mutual exclusion / repetition without inspecting `info`
+ * (which has SPRAY=0 as a default and would falsely trigger on a
+ * freshly-zeroed struct).
+ */
+#define F_SPRAY     (1u << 0)
+#define F_CANONICAL (1u << 1)
+
 static const struct option wganycast_opts[] = {
 	{ .name = "dest",      .has_arg = true, .val = OPT_DEST },
 	{ .name = "canonical", .has_arg = true, .val = OPT_CANONICAL },
@@ -43,7 +51,7 @@ static int wganycast_parse(int c, char **argv, int invert, unsigned int *flags,
 
 	switch (c) {
 	case OPT_DEST:
-		if (info->mode == XT_WGANYCAST_MODE_CANONICAL)
+		if (*flags & F_CANONICAL)
 			xtables_error(PARAMETER_PROBLEM,
 				"WGANYCAST: --dest and --canonical are mutually exclusive");
 		if (info->ndests >= XT_WGANYCAST_MAX_DESTS)
@@ -55,14 +63,14 @@ static int wganycast_parse(int c, char **argv, int invert, unsigned int *flags,
 				"WGANYCAST: bad --dest address: %s", optarg);
 		info->mode = XT_WGANYCAST_MODE_SPRAY;
 		info->dests[info->ndests++] = addr.s_addr;
-		*flags |= 1;
+		*flags |= F_SPRAY;
 		return true;
 
 	case OPT_CANONICAL:
-		if (info->mode == XT_WGANYCAST_MODE_SPRAY)
+		if (*flags & F_SPRAY)
 			xtables_error(PARAMETER_PROBLEM,
 				"WGANYCAST: --dest and --canonical are mutually exclusive");
-		if (info->ndests > 0)
+		if (*flags & F_CANONICAL)
 			xtables_error(PARAMETER_PROBLEM,
 				"WGANYCAST: --canonical can only be specified once");
 		if (!inet_aton(optarg, &addr))
@@ -71,7 +79,7 @@ static int wganycast_parse(int c, char **argv, int invert, unsigned int *flags,
 		info->mode = XT_WGANYCAST_MODE_CANONICAL;
 		info->dests[0] = addr.s_addr;
 		info->ndests = 1;
-		*flags |= 1;
+		*flags |= F_CANONICAL;
 		return true;
 	}
 
