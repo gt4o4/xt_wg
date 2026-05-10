@@ -16,7 +16,7 @@ libxtables_CFLAGS = @libxtables_CFLAGS@
 libxtables_LIBS   = @libxtables_LIBS@
 AM_DEPFLAGS     = -Wp,-MMD,$(@D)/.$(@F).d,-MT,$@
 
-TARGETS = libxt_WGOBFS.so libxt_WGANYCAST.so
+TARGETS = libxt_WGOBFS.so libxt_WGANYCAST.so libxt_WGPTCP.so
 
 .PHONY: all install clean
 all: ${TARGETS}

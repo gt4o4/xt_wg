@@ -1,4 +1,5 @@
 
-obj-m += xt_WGOBFS.o xt_WGANYCAST.o
+obj-m += xt_WGOBFS.o xt_WGANYCAST.o xt_WGPTCP.o
 xt_WGOBFS-y += xt_WGOBFS_main.o chacha.o
 xt_WGANYCAST-y += xt_WGANYCAST_main.o
+xt_WGPTCP-y += xt_WGPTCP_main.o
