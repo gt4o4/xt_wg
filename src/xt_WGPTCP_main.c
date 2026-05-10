@@ -114,46 +114,32 @@ static const u8 *wgptcp_keybytes(const struct xt_wgptcp_info *info)
 }
 
 static __be32 wgptcp_cookie(const struct xt_wgptcp_info *info,
-			    __be32 saddr, __be32 daddr)
+			    __be32 tcph_seq)
 {
 	siphash_key_t key;
 	u8 buf[8];
-	__be32 lo, hi;
 
 	if (!info->has_key)
 		return cpu_to_be32(XT_WGPTCP_FIXED_COOKIE);
 
-	/* Canonical IP order — hash the (lower-IP, higher-IP) tuple rather
-	 * than (saddr, daddr).  Three benefits:
+	/* Cookie hash input: the TCP `seq` field from this packet.
 	 *
-	 *   1. The same flow gets the same cookie in both directions
-	 *      (A→B and B→A) — useful if a deep DPI box correlates
-	 *      bidirectional flows by marker.
-	 *   2. Survives any path-side address rewriting that preserves
-	 *      the {saddr, daddr} set (e.g. ACL gateways that swap
-	 *      source/dest for a mirrored port).
-	 *   3. Encoder and decoder agree even in the corner case where
-	 *      reverse-path filtering or asymmetric routing causes one
-	 *      end to see iph fields differently from the other —
-	 *      shouldn't happen in normal deployments, but the canonical
-	 *      hash sidesteps it without cost.
+	 * `tcph->seq` is itself derived (via wgptcp_derive) from the WG
+	 * payload's sender_index / receiver_index — a value that travels
+	 * inside the encrypted WG message and is therefore NAT-immune
+	 * (no SNAT / DNAT box rewrites TCP sequence numbers; if one did
+	 * it would break real TCP).  By hashing seq, the cookie inherits
+	 * the same NAT-immunity, so encoder and decoder agree even when
+	 * the path between them does 1:1 NAT, Cloudflare-Spectrum DNAT,
+	 * or anything else that mangles iph->saddr / iph->daddr.
 	 *
-	 * It does NOT survive NAT that actually changes IP *values* (DNAT
-	 * to a different address, SNAT after the encoder hook).  For that,
-	 * exclude the peer from services.gfw-cloudflare-dnat.mappings —
-	 * see the wg-ptcp.nix module documentation.
+	 * The "ckie" 4-byte domain separator prevents this hash from
+	 * accidentally colliding with a `wgptcp_derive` output for some
+	 * (key, role) combination.
 	 */
-	if ((u32)be32_to_cpu(saddr) < (u32)be32_to_cpu(daddr)) {
-		lo = saddr;
-		hi = daddr;
-	} else {
-		lo = daddr;
-		hi = saddr;
-	}
-
 	memcpy(&key, info->key, sizeof(key));
-	memcpy(buf,     &lo, 4);
-	memcpy(buf + 4, &hi, 4);
+	memcpy(buf,     &tcph_seq, 4);
+	memcpy(buf + 4, "ckie",    4);
 	return cpu_to_be32((u32)siphash(buf, 8, &key));
 }
 
@@ -246,7 +232,12 @@ static unsigned int wgptcp_encode_common(struct sk_buff *skb,
 		opts[1] = WGPTCP_TCPOPT_NOP;
 		opts[2] = WGPTCP_TCPOPT_TFO;
 		opts[3] = WGPTCP_TCPOPT_TFO_LEN;
-		cookie  = wgptcp_cookie(info, iph->saddr, iph->daddr);
+		/* tcph->seq is already populated above and encodes a
+		 * SipHash of the WG sender_index — derive the cookie from
+		 * it so the marker travels with the (NAT-immune) seq value
+		 * rather than the (NAT-mutable) iph addresses.
+		 */
+		cookie  = wgptcp_cookie(info, tcph->seq);
 		memcpy(opts + 4, &cookie, 4);
 	}
 
@@ -471,7 +462,7 @@ static unsigned int wgptcp_decode_v4(struct sk_buff *skb,
 	 * no TFO option in real TCP after the handshake.
 	 */
 	if (tcph->syn) {
-		__be32 expected = wgptcp_cookie(info, iph->saddr, iph->daddr);
+		__be32 expected = wgptcp_cookie(info, tcph->seq);
 
 		if (!wgptcp_match_tfo_cookie(tcph, tcp_hdr_len, expected))
 			return XT_CONTINUE;
