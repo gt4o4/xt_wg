@@ -13,7 +13,10 @@
  *     -j WGANYCAST --dest 161.248.136.186:59263 --dest 138.252.162.176:59263
  *
  *   # canonicalise replies so WG sees a single peer endpoint
- *   iptables -t mangle -A PREROUTING -p udp --sport 59263 -s 138.252.162.176 \
+ *   # canonicalise replies — use `raw` (priority -300) not `mangle`
+ *   # (-150) so the rewrite predates conntrack, giving one symmetric
+ *   # conntrack entry instead of two orphan per-direction entries.
+ *   iptables -t raw -A PREROUTING -p udp --sport 59263 -s 138.252.162.176 \
  *     -j WGANYCAST --canonical 193.134.211.67:51821
  */
 

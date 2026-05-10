@@ -206,15 +206,20 @@ peer, two paths), but applicable to any UDP service.
 - **`SPRAY`** (`--dest`) — for each outbound packet matched by the rule,
   picks one entry uniformly at random from the destination pool and
   rewrites the packet's destination IP (and optionally port). Use in
-  `OUTPUT` or `POSTROUTING` `mangle`.
+  `OUTPUT` or `POSTROUTING` `mangle` (priority -150, AFTER conntrack at
+  -200, so conntrack records the canonical dst — single stable entry
+  regardless of which pool member the spray picked).
 - **`CANONICAL`** (`--canonical`) — rewrites an inbound packet's source
   IP (and optionally port) to a single canonical address. Use in
-  `PREROUTING` `mangle` to make replies from any pool member look like
-  they came from one peer endpoint, so WireGuard's roaming stays pinned.
+  `PREROUTING` `raw` (priority -300, BEFORE conntrack at -200, so the
+  inbound conntrack entry's reply tuple matches the OUTPUT entry — one
+  symmetric conntrack entry per flow instead of two orphans). Makes
+  replies from any pool member look like they came from one peer
+  endpoint, so WireGuard's roaming stays pinned.
 
 The two flags are mutually exclusive in a single rule. A typical
-WireGuard deployment installs one `SPRAY` rule on `OUTPUT` plus one
-`CANONICAL` rule per pool member on `PREROUTING`.
+WireGuard deployment installs one `SPRAY` rule on `OUTPUT` mangle plus
+one `CANONICAL` rule per pool member on `PREROUTING` raw.
 
 ### Address syntax
 
@@ -229,12 +234,13 @@ Up to 8 destinations per `--dest` rule.
 
 ### Stateless on purpose
 
-WGANYCAST does not interact with conntrack. It modifies the packet at
-`mangle` priority and returns `XT_CONTINUE`. Conntrack runs after
-(`OUTPUT`) or before (`PREROUTING`) mangle and tracks the modified
-tuple, but no NAT mapping is registered — so each packet's destination
+WGANYCAST does not register NAT mappings — each packet's destination
 is decided fresh by the random pick, no per-flow stickiness. (If you
 want per-flow stickiness, use a hash-based `iptables -j DNAT` instead.)
+The asymmetric placement (mangle OUTPUT for SPRAY, raw PREROUTING for
+CANONICAL) is chosen so that conntrack tracks each direction with the
+same canonical (peer, local) tuple — one entry per flow, not two
+asymmetric orphans.
 
 ### Example: WireGuard over two Cloudflare Spectrum anycasts
 
@@ -248,10 +254,12 @@ iptables -t mangle -A OUTPUT -p udp -d 193.134.211.67 --dport 51821 \
   --dest 138.252.162.176:59263
 
 # Ingress: canonicalise replies from either anycast back to the original
-# peer:port so WireGuard sees one stable endpoint
-iptables -t mangle -A PREROUTING -p udp -s 161.248.136.186 --sport 59263 \
+# peer:port so WireGuard sees one stable endpoint. Use `raw` table so
+# the rewrite predates conntrack — inbound entry's reply tuple then
+# matches the OUTPUT spray's entry.
+iptables -t raw -A PREROUTING -p udp -s 161.248.136.186 --sport 59263 \
   -j WGANYCAST --canonical 193.134.211.67:51821
-iptables -t mangle -A PREROUTING -p udp -s 138.252.162.176 --sport 59263 \
+iptables -t raw -A PREROUTING -p udp -s 138.252.162.176 --sport 59263 \
   -j WGANYCAST --canonical 193.134.211.67:51821
 ```
 
@@ -261,9 +269,9 @@ all entries:
 ```shell
 iptables -t mangle -A OUTPUT -p udp -d 193.134.211.67 --dport 51821 \
   -j WGANYCAST --dest 161.248.136.186 --dest 138.252.162.176
-iptables -t mangle -A PREROUTING -p udp -s 161.248.136.186 --sport 51821 \
+iptables -t raw -A PREROUTING -p udp -s 161.248.136.186 --sport 51821 \
   -j WGANYCAST --canonical 193.134.211.67
-iptables -t mangle -A PREROUTING -p udp -s 138.252.162.176 --sport 51821 \
+iptables -t raw -A PREROUTING -p udp -s 138.252.162.176 --sport 51821 \
   -j WGANYCAST --canonical 193.134.211.67
 ```
 
