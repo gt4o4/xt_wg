@@ -9,6 +9,7 @@
 #include "xt_WGOBFS.h"
 #include "wg.h"
 #include "chacha.h"
+#include "xt_wg_common.h"
 
 #if IS_ENABLED(CONFIG_IP6_NF_IPTABLES)
 #include <net/ipv6.h>

@@ -27,6 +27,7 @@
 #include <net/ip.h>
 #include <net/udp.h>
 #include "xt_WGANYCAST.h"
+#include "xt_wg_common.h"
 
 static unsigned int wganycast_target(struct sk_buff *skb,
 				     const struct xt_action_param *par)
