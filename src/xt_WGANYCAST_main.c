@@ -121,7 +121,10 @@ static int wganycast_checkentry(const struct xt_tgchk_param *par)
 	return 0;
 }
 
-static struct xt_target xt_wganycast_reg[] __read_mostly = {
+/* Target array exposed to xt_wg_main.c for central registration in the
+ * consolidated xt_wg.ko (see xt_wg_common.h).
+ */
+struct xt_target xt_wganycast_targets[] __read_mostly = {
 	{
 		.name		= "WGANYCAST",
 		.revision	= 0,
@@ -132,21 +135,4 @@ static struct xt_target xt_wganycast_reg[] __read_mostly = {
 		.me		= THIS_MODULE,
 	},
 };
-
-static int __init xt_wganycast_init(void)
-{
-	return xt_register_targets(xt_wganycast_reg,
-				   ARRAY_SIZE(xt_wganycast_reg));
-}
-
-static void __exit xt_wganycast_exit(void)
-{
-	xt_unregister_targets(xt_wganycast_reg,
-			      ARRAY_SIZE(xt_wganycast_reg));
-}
-
-module_init(xt_wganycast_init);
-module_exit(xt_wganycast_exit);
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("xtables target: stateless UDP destination spray + source canonicalisation");
-MODULE_ALIAS("ipt_WGANYCAST");
+const unsigned int xt_wganycast_targets_n = ARRAY_SIZE(xt_wganycast_targets);

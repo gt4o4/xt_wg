@@ -493,7 +493,10 @@ static int wgptcp_checkentry(const struct xt_tgchk_param *par)
 	return 0;
 }
 
-static struct xt_target xt_wgptcp_reg[] __read_mostly = {
+/* Target array exposed to xt_wg_main.c for central registration in the
+ * consolidated xt_wg.ko (see xt_wg_common.h).
+ */
+struct xt_target xt_wgptcp_targets[] __read_mostly = {
 	{
 		.name		= "WGPTCP",
 		.revision	= 0,
@@ -504,19 +507,4 @@ static struct xt_target xt_wgptcp_reg[] __read_mostly = {
 		.me		= THIS_MODULE,
 	},
 };
-
-static int __init xt_wgptcp_init(void)
-{
-	return xt_register_targets(xt_wgptcp_reg, ARRAY_SIZE(xt_wgptcp_reg));
-}
-
-static void __exit xt_wgptcp_exit(void)
-{
-	xt_unregister_targets(xt_wgptcp_reg, ARRAY_SIZE(xt_wgptcp_reg));
-}
-
-module_init(xt_wgptcp_init);
-module_exit(xt_wgptcp_exit);
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("xtables target: WG-protocol-aware UDP↔fake-TCP transmutation");
-MODULE_ALIAS("ipt_WGPTCP");
+const unsigned int xt_wgptcp_targets_n = ARRAY_SIZE(xt_wgptcp_targets);

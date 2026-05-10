@@ -518,7 +518,10 @@ static bool xt_wg_obfs_checkentry(const struct xt_tgchk_param *par)
 }
 #endif
 
-static struct xt_target xt_wg_obfs[] __read_mostly = {
+/* Target array exposed to xt_wg_main.c for central registration in the
+ * consolidated xt_wg.ko (see xt_wg_common.h).
+ */
+struct xt_target xt_wgobfs_targets[] __read_mostly = {
         {
                 .name           = "WGOBFS",
                 .revision       = 0,
@@ -542,21 +545,4 @@ static struct xt_target xt_wg_obfs[] __read_mostly = {
         },
 #endif
 };
-
-static int __init wg_obfs_target_init(void)
-{
-        return xt_register_targets(xt_wg_obfs, ARRAY_SIZE(xt_wg_obfs));
-}
-
-static void __exit wg_obfs_target_exit(void)
-{
-        xt_unregister_targets(xt_wg_obfs, ARRAY_SIZE(xt_wg_obfs));
-}
-
-module_init(wg_obfs_target_init);
-module_exit(wg_obfs_target_exit);
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("Iptables obfuscation module for WireGuard");
-MODULE_AUTHOR("Wei Chen <weichen302@gmail.com>");
-MODULE_VERSION("0.6.1");
-MODULE_ALIAS("xt_WGOBFS");
+const unsigned int xt_wgobfs_targets_n = ARRAY_SIZE(xt_wgobfs_targets);
