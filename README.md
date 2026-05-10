@@ -357,13 +357,16 @@ flow as ESTABLISHED before the first PSH+ACK arrives.
 - For SYN-bearing packets: append `NOP NOP TFO_COOKIE(kind=34, len=6,
   4-byte cookie)`. The 4-byte cookie is the marker used by the
   decoder: either a fixed sentinel `0xC07F0001` (default, no `--key`),
-  or `siphash24(key, min(saddr,daddr) ‖ max(saddr,daddr))[0..4)`
-  (when `--key` is given). Canonical IP order means A→B and B→A get
-  the same marker for one flow, and the cookie survives any path-side
-  rewriting that preserves the `{saddr, daddr}` set. NAT that
-  changes the IP *values* (DNAT to a different address, SNAT after
-  the encoder hook) is not handled by canonicalisation — exclude
-  such peers from upstream NAT mappings instead.
+  or `siphash24(key, tcph->seq ‖ "ckie")[0..4)` (when `--key` is
+  given). Hashing `tcph->seq` rather than the iph addresses makes
+  the cookie **NAT-immune**: TCP sequence numbers are not rewritten
+  by any conventional NAT (1:1 NAT, Cloudflare Spectrum DNAT,
+  provider SNAT pools, etc. all preserve `seq`), so encoder and
+  decoder agree on the marker even across NAT'd paths. The seq
+  itself encodes a SipHash of the WG `sender_index` /
+  `receiver_index` (which lives in the encrypted WG payload) — so
+  the entire chain stays inside the WG message and never touches
+  IP-layer fields that NAT might mangle.
 - Rewrite IP `protocol` from 17 (UDP) to 6 (TCP). Full IP + TCP
   checksum recompute (not incremental, since L4 protocol shape
   changed).
