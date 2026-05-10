@@ -46,6 +46,7 @@
 #include <net/udp.h>
 #include "xt_WGPTCP.h"
 #include "wg.h"
+#include "xt_wg_common.h"
 
 /* WG message-type byte values (first byte of UDP payload). */
 #define WG_TYPE_INIT	0x01u
@@ -344,6 +345,29 @@ static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 		return XT_CONTINUE;
 	}
 
+	/* Optional WGOBFS-style payload mangling — applied while skb is
+	 * still UDP-shaped, so wg_obfs_payload's `udp_hdr(skb)` access
+	 * works.  After this returns, the WG message has variable random
+	 * padding appended (length encoded in the last byte) and its
+	 * first 16 bytes are XOR-scrambled.  We update IP/UDP length
+	 * fields here; UDP checksum is left zero because wgptcp_encode_common
+	 * is about to overwrite the L4 header anyway.
+	 */
+	if (info->has_obfs) {
+		u8 obfs_pad_len;
+		unsigned int rc = wg_obfs_payload(skb, &obfs_pad_len,
+						  info->obfs_key);
+		if (rc != XT_CONTINUE)
+			return rc;
+		iph = ip_hdr(skb);
+		ihl = iph->ihl * 4;
+		iph->tos     = 0;
+		iph->tot_len = htons(ntohs(iph->tot_len) + obfs_pad_len);
+		udph = (struct udphdr *)((u8 *)iph + ihl);
+		udph->len    = htons(ntohs(udph->len) + obfs_pad_len);
+		udph->check  = 0;
+	}
+
 	return wgptcp_encode_common(skb, info, flags, seq, ack_seq, tcp_hdr_len);
 }
 
@@ -452,6 +476,25 @@ static unsigned int wgptcp_decode_v4(struct sk_buff *skb,
 
 	iph->protocol = IPPROTO_UDP;
 	iph->tot_len  = htons(ihl + sizeof(struct udphdr) + payload_len);
+
+	/* Optional WGOBFS-style un-mangling — read the padding-length
+	 * marker from the last byte, trim it, restore the head 16 bytes
+	 * via the same chacha PRN.  Must run while skb is UDP-shaped
+	 * (wg_unobfs_payload uses udp_hdr(skb)).  After this the IP +
+	 * UDP length fields shrink by `obfs_pad_len`.
+	 */
+	if (info->has_obfs) {
+		u8 obfs_pad_len;
+		unsigned int rc = wg_unobfs_payload(skb, &obfs_pad_len,
+						    info->obfs_key);
+		if (rc != XT_CONTINUE)
+			return rc;
+		iph = ip_hdr(skb);
+		iph->tot_len = htons(ntohs(iph->tot_len) - obfs_pad_len);
+		udph = (struct udphdr *)((u8 *)iph + ihl);
+		udph->len    = htons(ntohs(udph->len) - obfs_pad_len);
+	}
+
 	iph->check    = 0;
 	ip_send_check(iph);
 

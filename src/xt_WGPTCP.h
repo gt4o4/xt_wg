@@ -28,14 +28,17 @@
 #define XT_WGPTCP_MODE_ENCODE 0
 #define XT_WGPTCP_MODE_DECODE 1
 
-#define XT_WGPTCP_KEY_SIZE     16
-#define XT_WGPTCP_FIXED_COOKIE 0xC07F0001U
+#define XT_WGPTCP_KEY_SIZE        16
+#define XT_WGPTCP_OBFS_KEY_SIZE   32
+#define XT_WGPTCP_FIXED_COOKIE    0xC07F0001U
 
 struct xt_wgptcp_info {
 	__u8 mode;	/* XT_WGPTCP_MODE_* */
 	__u8 has_key;	/* 0 = fixed sentinel, 1 = siphash-keyed */
-	__u8 _pad[2];
+	__u8 has_obfs;	/* 0 = TCP-wrap only, 1 = WGOBFS-style payload mangle */
+	__u8 _pad[1];
 	__u8 key[XT_WGPTCP_KEY_SIZE];
+	__u8 obfs_key[XT_WGPTCP_OBFS_KEY_SIZE];
 };
 
 #endif

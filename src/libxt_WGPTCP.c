@@ -15,6 +15,7 @@ enum {
 	OPT_ENCODE = 0,
 	OPT_DECODE,
 	OPT_KEY,
+	OPT_OBFS,
 };
 
 /* `*flags` bits — set per-invocation in xtables_target.parse() so we can
@@ -25,21 +26,31 @@ enum {
 #define F_ENCODE (1u << 0)
 #define F_DECODE (1u << 1)
 #define F_KEY    (1u << 2)
+#define F_OBFS   (1u << 3)
 
 static const struct option wgptcp_opts[] = {
 	{ .name = "encode", .has_arg = false, .val = OPT_ENCODE },
 	{ .name = "decode", .has_arg = false, .val = OPT_DECODE },
 	{ .name = "key",    .has_arg = true,  .val = OPT_KEY },
+	{ .name = "obfs",   .has_arg = false, .val = OPT_OBFS },
 	{}
 };
 
 static void wgptcp_help(void)
 {
 	printf("WGPTCP target options:\n"
-	       "    --encode             rewrite UDP → fake-TCP-SYN with TFO cookie\n"
-	       "    --decode             reverse: fake-TCP-SYN → UDP\n"
+	       "    --encode             rewrite UDP → fake-TCP with WG-protocol-aware shape\n"
+	       "    --decode             reverse: fake-TCP → UDP\n"
 	       "    --key <32 hex chars> 16-byte key for siphash-derived cookie marker\n"
-	       "                         (default: fixed sentinel cookie 0xC07F0001)\n"
+	       "                         and (when --obfs is set) WGOBFS chacha key\n"
+	       "                         (default: fixed sentinel cookie 0xC07F0001,\n"
+	       "                          --obfs requires --key)\n"
+	       "    --obfs               also apply WGOBFS-style payload obfuscation:\n"
+	       "                         chacha-XOR the first 16 bytes of the WG message,\n"
+	       "                         append random padding (length encoded in last\n"
+	       "                         byte), drop ~80%% of WG keepalives, mac2-zero\n"
+	       "                         restoration on handshake messages.  Requires\n"
+	       "                         --key; chacha key = key||key (32 bytes).\n"
 	       "\n"
 	       "  --encode and --decode are mutually exclusive; exactly one is required.\n"
 	       "  Decoder rule MUST be installed in `raw` PREROUTING (priority -300,\n"
@@ -112,7 +123,23 @@ static int wgptcp_parse(int c, char **argv, int invert, unsigned int *flags,
 				"WGPTCP: --key must be exactly %d hex characters",
 				XT_WGPTCP_KEY_SIZE * 2);
 		info->has_key = 1;
+		/* Derive a 32-byte chacha key for the optional --obfs payload
+		 * mangling: obfs_key = key || key.  Always set; kernel only
+		 * uses it when info->has_obfs is true.
+		 */
+		memcpy(info->obfs_key,                      info->key,
+		       XT_WGPTCP_KEY_SIZE);
+		memcpy(info->obfs_key + XT_WGPTCP_KEY_SIZE, info->key,
+		       XT_WGPTCP_KEY_SIZE);
 		*flags |= F_KEY;
+		return true;
+
+	case OPT_OBFS:
+		if (*flags & F_OBFS)
+			xtables_error(PARAMETER_PROBLEM,
+				"WGPTCP: --obfs can only be specified once");
+		info->has_obfs = 1;
+		*flags |= F_OBFS;
 		return true;
 	}
 
@@ -124,6 +151,9 @@ static void wgptcp_check(unsigned int flags)
 	if (!(flags & (F_ENCODE | F_DECODE)))
 		xtables_error(PARAMETER_PROBLEM,
 			"WGPTCP: --encode or --decode is required");
+	if ((flags & F_OBFS) && !(flags & F_KEY))
+		xtables_error(PARAMETER_PROBLEM,
+			"WGPTCP: --obfs requires --key (chacha key = key||key)");
 }
 
 static void wgptcp_print(const void *entry,
@@ -142,6 +172,8 @@ static void wgptcp_print(const void *entry,
 		for (i = 0; i < XT_WGPTCP_KEY_SIZE; i++)
 			printf("%02x", info->key[i]);
 	}
+	if (info->has_obfs)
+		printf(" --obfs");
 }
 
 static void wgptcp_save(const void *entry,

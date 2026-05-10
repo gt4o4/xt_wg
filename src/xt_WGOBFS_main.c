@@ -181,8 +181,21 @@ static int prepare_skb_for_insert(struct sk_buff *skb, int ntail)
         return 0;
 }
 
-static unsigned int xt_obfs_udp_payload(struct sk_buff *skb, u8 *rnd_len_out,
-                                        const struct xt_wg_obfs_info *info)
+/* Encode-side helper: scramble the UDP payload of `skb` (assumed to
+ * carry a WG message) by XOR-ing the first 16 bytes with a chacha-
+ * derived PRN, appending random padding (length encoded in the last
+ * byte of the obfuscated message), and obfuscating the all-zero mac2
+ * field of handshake messages.  Caller must update iph->{tos,
+ * tot_len, check} and udph->{len, check} for the +rnd_len growth.
+ *
+ * Exposed (non-static) for reuse by xt_WGPTCP's --obfs option, which
+ * calls this on the UDP-shaped skb BEFORE wrapping in fake-TCP.
+ *
+ * Returns XT_CONTINUE on success (with `*rnd_len_out` set), or NF_DROP
+ * on randomly-dropped keepalive / skb expansion failure.
+ */
+unsigned int wg_obfs_payload(struct sk_buff *skb, u8 *rnd_len_out,
+                             const u8 *chacha_key)
 {
         struct obfs_buf ob;
         struct udphdr *udph;
@@ -214,15 +227,14 @@ static unsigned int xt_obfs_udp_payload(struct sk_buff *skb, u8 *rnd_len_out,
          */
         ob.chacha_in[0] += 42;
 
-        if (random_drop_wg_keepalive(buf_udp, wg_data_len, &ob,
-                                     info->chacha_key))
+        if (random_drop_wg_keepalive(buf_udp, wg_data_len, &ob, chacha_key))
                 return NF_DROP;
 
         /* Insert a long pseudo-random string if the WG packet is small, or a
          * short string if WG packet is big.
          */
         max_rnd_len = (wg_data_len > 200) ? 8 : MAX_RND_LEN;
-        rnd_len = get_prn_insert(buf_udp, &ob, info->chacha_key, MIN_RND_LEN,
+        rnd_len = get_prn_insert(buf_udp, &ob, chacha_key, MIN_RND_LEN,
                                  max_rnd_len);
         ob.rnd_len = rnd_len;
         if (prepare_skb_for_insert(skb, rnd_len))
@@ -230,7 +242,7 @@ static unsigned int xt_obfs_udp_payload(struct sk_buff *skb, u8 *rnd_len_out,
 
         udph = udp_hdr(skb);
         buf_udp = (u8 *)udph + sizeof(struct udphdr);
-        obfs_wg(buf_udp, wg_data_len, &ob, info->chacha_key);
+        obfs_wg(buf_udp, wg_data_len, &ob, chacha_key);
 
         *rnd_len_out = rnd_len;
         return XT_CONTINUE;
@@ -244,7 +256,7 @@ static unsigned int xt_obfs4(struct sk_buff *skb,
         u8 rnd_len;
         unsigned int rc;
 
-        rc = xt_obfs_udp_payload(skb, &rnd_len, info);
+        rc = wg_obfs_payload(skb, &rnd_len, info->chacha_key);
         if (XT_CONTINUE != rc)
                 return rc;
 
@@ -282,7 +294,7 @@ static unsigned int xt_obfs6(struct sk_buff *skb,
         u8 rnd_len;
         unsigned int rc;
 
-        rc = xt_obfs_udp_payload(skb, &rnd_len, info);
+        rc = wg_obfs_payload(skb, &rnd_len, info->chacha_key);
         if (XT_CONTINUE != rc)
                 return rc;
 
@@ -355,8 +367,19 @@ static u8 restore_wg(u8 *buf, int len, const u8 *key)
         return rnd_len;
 }
 
-static int xt_unobfs_udp_payload(struct sk_buff *skb, u8 *rnd_len_out,
-                                 const struct xt_wg_obfs_info *info)
+/* Decode-side helper: reverse wg_obfs_payload — read the padding-length
+ * marker from the last byte, trim it, restore the head 16 bytes via
+ * the same chacha PRN, and unmangle mac2 if marked.  Caller must update
+ * iph->{tot_len, check} and udph->{len, check} for the -rnd_len shrink.
+ *
+ * Exposed (non-static) for reuse by xt_WGPTCP's --obfs option, which
+ * calls this on the UDP-shaped skb AFTER unwrapping the fake-TCP.
+ *
+ * Returns XT_CONTINUE on success (with `*rnd_len_out` set), or NF_DROP
+ * on too-small payload / invalid marker / writability failure.
+ */
+int wg_unobfs_payload(struct sk_buff *skb, u8 *rnd_len_out,
+                      const u8 *chacha_key)
 {
         struct udphdr *udph;
         u8 *buf_udp;
@@ -377,7 +400,7 @@ static int xt_unobfs_udp_payload(struct sk_buff *skb, u8 *rnd_len_out,
         if (data_len < (WG_MIN_LEN + MIN_RND_LEN))
                 return NF_DROP;
 
-        rnd_len = restore_wg(buf_udp, data_len, info->chacha_key);
+        rnd_len = restore_wg(buf_udp, data_len, chacha_key);
         if (rnd_len == 0)
                 return NF_DROP;
 
@@ -395,7 +418,7 @@ static unsigned int xt_unobfs4(struct sk_buff *skb,
         u8 rnd_len;
         unsigned int rc;
 
-        rc = xt_unobfs_udp_payload(skb, &rnd_len, info);
+        rc = wg_unobfs_payload(skb, &rnd_len, info->chacha_key);
         if (XT_CONTINUE != rc)
                 return rc;
 
@@ -428,7 +451,7 @@ static unsigned int xt_unobfs6(struct sk_buff *skb,
         u8 rnd_len;
         unsigned int rc;
 
-        rc = xt_unobfs_udp_payload(skb, &rnd_len, info);
+        rc = wg_unobfs_payload(skb, &rnd_len, info->chacha_key);
         if (XT_CONTINUE != rc)
                 return rc;
 
