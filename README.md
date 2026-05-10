@@ -22,9 +22,17 @@ running WireGuard across hostile or asymmetric networks:
   the kernel TCP stack never sees the fake-TCP packets — no companion
   `-j DROP` rule is needed. Described in [§ WGPTCP](#wgptcp) below.
 
-All three targets ship in the same `xt_*.ko` kernel module set and share
-the build system (`autotools` + the `src/Makefile.libxt.in` userspace
-plugin template).
+All three targets ship in **one consolidated** `xt_wg.ko` kernel module
+(plus three userspace plugins, one per target). Backward-compat aliases
+mean `modprobe xt_WGOBFS` / `xt_WGANYCAST` / `xt_WGPTCP` all still
+resolve to `xt_wg.ko` via the kernel's modalias lookup, so existing
+`/etc/modules-load.d/` entries and iptables auto-load (which uses
+`request_module("ipt_<NAME>")`) keep working unchanged. The shared `.ko`
+also lets WGPTCP reuse WGOBFS's chacha-keyed payload mangling via the
+`--obfs` flag (see [§ WGPTCP](#wgptcp)) without duplicating code.
+
+The build system is `autotools` + the `src/Makefile.libxt.in` userspace
+plugin template.
 
 
 ## Build & install (both targets)
@@ -46,8 +54,13 @@ make
 
 Produces:
 
-- `src/xt_WGOBFS.ko`, `src/xt_WGANYCAST.ko`, `src/xt_WGPTCP.ko` (kernel modules)
-- `src/libxt_WGOBFS.so`, `src/libxt_WGANYCAST.so`, `src/libxt_WGPTCP.so` (userspace iptables plugins)
+- `src/xt_wg.ko` — single kernel module, registers all three targets
+  (WGOBFS, WGANYCAST, WGPTCP) from one `module_init`. Backward-compat
+  via per-target `MODULE_ALIAS` (`xt_WGOBFS`, `ipt_WGOBFS`,
+  `ip6t_WGOBFS`, `xt_WGANYCAST`, `ipt_WGANYCAST`, `xt_WGPTCP`,
+  `ipt_WGPTCP`).
+- `src/libxt_WGOBFS.so`, `src/libxt_WGANYCAST.so`, `src/libxt_WGPTCP.so`
+  — three separate userspace iptables plugins, one per target name.
 
 ### Install
 
@@ -55,9 +68,10 @@ Produces:
 sudo make install
 ```
 
-Then `sudo depmod -a && sudo modprobe xt_WGOBFS xt_WGANYCAST xt_WGPTCP`
-to load the modules. Add to `/etc/modules-load.d/` (or distro equivalent)
-for boot-time loading.
+Then `sudo depmod -a && sudo modprobe xt_wg` to load all three targets.
+(`modprobe xt_WGOBFS` / `xt_WGANYCAST` / `xt_WGPTCP` all also work via
+the per-target aliases.) Add to `/etc/modules-load.d/` (or distro
+equivalent) for boot-time loading.
 
 By default, openSUSE does not allow unsupported kernel modules. To
 override, create or modify `/etc/modprobe.d/10-unsupported-modules.conf`
@@ -384,7 +398,7 @@ after the kernel might already RST).
 
 ### Usage
 
-This extension takes two parameters.
+This extension takes three parameters.
 
 `--encode` or `--decode` to indicate the operation mode.
 
@@ -393,6 +407,17 @@ derive the per-direction TFO cookie via SipHash-2-4 over (source IP ‖
 dest IP). Both ends must agree. When omitted, a fixed sentinel cookie
 is used; this works but is more easily mis-classified if a real TFO
 client happens to connect to the same port.
+
+`--obfs` (optional) — also apply WGOBFS-style payload obfuscation to
+the WG message inside the fake-TCP segment: chacha-XOR the first 16
+bytes, append random padding (length encoded in the last byte), drop
+~80 % of WG keepalives, and zero-restore the mac2 field on handshake
+messages. Useful when a deep-DPI middlebox unwraps the TCP and
+inspects the inner bytes — the WG message signature would otherwise
+leak through. Requires `--key`; the chacha key is derived as
+`key || key` (32 bytes from the 16-byte siphash key). Per-packet wire
+growth becomes +24..+52 B for handshake, +16..+44 B for transport
+(the random padding length varies). Both ends must agree.
 
 On the **client** (encoder side):
 
@@ -409,6 +434,12 @@ iptables -t mangle -A OUTPUT -p udp -d <peer> --dport 51821 \
 # rely on the rule's peer IP/port filter as their marker.
 iptables -t raw -A PREROUTING -p tcp -s <peer> --sport 51821 \
   -j WGPTCP --decode --key 0123456789abcdef0123456789abcdef
+
+# With WGOBFS-style payload mangling (must add --obfs on BOTH ends):
+iptables -t mangle -A OUTPUT -p udp -d <peer> --dport 51821 \
+  -j WGPTCP --encode --key 0123456789abcdef0123456789abcdef --obfs
+iptables -t raw -A PREROUTING -p tcp -s <peer> --sport 51821 \
+  -j WGPTCP --decode --key 0123456789abcdef0123456789abcdef --obfs
 ```
 
 On the **server** (decoder side, mirror image): swap source/dest and
@@ -418,11 +449,14 @@ encode and decode on each side regardless of who initiates.
 
 ### MTU
 
-Handshake packets grow by +20 B; transport packets grow by +12 B.
-Worst case is +20 B. WireGuard's default MTU 1420 fits in a 1500-byte
-underlay (1440 ≤ 1500). On tighter underlays (1280, IPv6-only links,
-PPPoE), lower the WG MTU accordingly: `MTU ≤ <underlay-mtu> - 80`
-(60 = IP + TCP-with-TFO header; 20 = WG transport overhead).
+Without `--obfs`: handshake packets grow by +20 B; transport packets
+grow by +12 B. With `--obfs`: handshake +24..+52 B, transport
++16..+44 B (random padding component). Worst case is +52 B.
+WireGuard's default MTU 1420 fits in a 1500-byte underlay even at
+worst case (1420 + 52 = 1472 ≤ 1500). On tighter underlays (1280,
+IPv6-only links, PPPoE), lower the WG MTU accordingly:
+`MTU ≤ <underlay-mtu> - 80` (without `--obfs`) or
+`MTU ≤ <underlay-mtu> - 112` (with `--obfs`).
 
 ### Operational notes
 
