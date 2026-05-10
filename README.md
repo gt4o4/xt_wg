@@ -357,7 +357,13 @@ flow as ESTABLISHED before the first PSH+ACK arrives.
 - For SYN-bearing packets: append `NOP NOP TFO_COOKIE(kind=34, len=6,
   4-byte cookie)`. The 4-byte cookie is the marker used by the
   decoder: either a fixed sentinel `0xC07F0001` (default, no `--key`),
-  or `siphash24(key, saddr ‖ daddr)[0..4)` (when `--key` is given).
+  or `siphash24(key, min(saddr,daddr) ‖ max(saddr,daddr))[0..4)`
+  (when `--key` is given). Canonical IP order means A→B and B→A get
+  the same marker for one flow, and the cookie survives any path-side
+  rewriting that preserves the `{saddr, daddr}` set. NAT that
+  changes the IP *values* (DNAT to a different address, SNAT after
+  the encoder hook) is not handled by canonicalisation — exclude
+  such peers from upstream NAT mappings instead.
 - Rewrite IP `protocol` from 17 (UDP) to 6 (TCP). Full IP + TCP
   checksum recompute (not incremental, since L4 protocol shape
   changed).
