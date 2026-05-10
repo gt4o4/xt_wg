@@ -16,18 +16,20 @@ libxtables_CFLAGS = @libxtables_CFLAGS@
 libxtables_LIBS   = @libxtables_LIBS@
 AM_DEPFLAGS     = -Wp,-MMD,$(@D)/.$(@F).d,-MT,$@
 
-TARGET = libxt_WGOBFS.so
+TARGETS = libxt_WGOBFS.so libxt_WGANYCAST.so
 
 .PHONY: all install clean
-all: ${TARGET}
+all: ${TARGETS}
 
 install:
-	install -pm0755 ${TARGET} "${DESTDIR}/${xtlibdir}"
+	for t in ${TARGETS}; do \
+		install -pm0755 $$t "${DESTDIR}/${xtlibdir}"; \
+	done
 
 clean:
 	rm -f *.oo *.so;
 
-${TARGET}: libxt_WGOBFS.oo
+%.so: %.oo
 	${CCLD} ${AM_LDFLAGS} -shared ${LDFLAGS} -o $@ $< ${libxtables_LIBS} ${LDLIBS}
 
 %.oo: %.c

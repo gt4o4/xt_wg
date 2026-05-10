@@ -1,3 +1,4 @@
 
-obj-m += xt_WGOBFS.o
+obj-m += xt_WGOBFS.o xt_WGANYCAST.o
 xt_WGOBFS-y += xt_WGOBFS_main.o chacha.o
+xt_WGANYCAST-y += xt_WGANYCAST_main.o
