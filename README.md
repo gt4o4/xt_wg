@@ -11,13 +11,16 @@ running WireGuard across hostile or asymmetric networks:
   matching source canonicalisation for the reply path. Lets a single WG
   flow ride two or more anycast destinations without involving conntrack
   / DNAT (described in [§ WGANYCAST](#wganycast) below).
-- **`WGPTCP`** — stateless UDP↔fake-TCP transmutation: rewrites outbound
-  UDP into a TCP SYN+TFO-cookie (RFC 7413) carrying the original payload
-  as TCP data, and the reverse on inbound. Useful when middleboxes block
-  or rate-limit UDP. Per-packet overhead +20 bytes (TCP base 20 + 8 opts
-  − UDP 8). Decoder runs in `raw` PREROUTING so the kernel TCP stack
-  never sees the fake SYN — no companion `-j DROP` rule is needed.
-  Described in [§ WGPTCP](#wgptcp) below.
+- **`WGPTCP`** — stateless WG-protocol-aware UDP↔fake-TCP transmutation:
+  reads the WG message-type byte and dispatches each packet to the
+  matching TCP shape (handshake initiation → SYN+TFO, response/cookie
+  → SYN+ACK+TFO, transport data → PSH+ACK). Reproduces a textbook TCP
+  3-way handshake on the wire so stateful firewalls / NAT helpers
+  register a clean ESTABLISHED transition. Useful when middleboxes
+  block or rate-limit UDP. Per-packet overhead +20 B for handshake
+  packets, +12 B for transport. Decoder runs in `raw` PREROUTING so
+  the kernel TCP stack never sees the fake-TCP packets — no companion
+  `-j DROP` rule is needed. Described in [§ WGPTCP](#wgptcp) below.
 
 All three targets ship in the same `xt_*.ko` kernel module set and share
 the build system (`autotools` + the `src/Makefile.libxt.in` userspace
@@ -283,44 +286,81 @@ per-packet.
 
 ## WGPTCP
 
-Stateless UDP↔fake-TCP-SYN transmutation. Useful when the network
-between you and the WG peer drops or rate-limits UDP, but lets TCP
-through. Unlike [udp2raw](https://github.com/wangyu-/udp2raw), there
-is no userspace daemon, no handshake, no per-flow state — every
-packet is independently rewritten in the netfilter hook.
+WG-protocol-aware stateless UDP↔fake-TCP transmutation. Useful when
+the network between you and the WG peer drops or rate-limits UDP, but
+lets TCP through. Unlike [udp2raw](https://github.com/wangyu-/udp2raw),
+there is no userspace daemon, no handshake state machine, no per-flow
+table — every packet is independently rewritten in the netfilter hook,
+with TCP fields derived statelessly from the WG message contents and
+a shared `--key`.
 
 ### How it works
 
-**Encode (UDP → fake TCP SYN with TFO data):**
+The encoder reads the WG message-type byte at the start of the UDP
+payload and dispatches each WG message type to a different TCP shape
+so the wire reproduces a textbook 3-way handshake + ESTABLISHED data
+exchange:
 
-- Strip the 8-byte UDP header, push a 20-byte TCP base header + 8 bytes
-  of TCP options (`NOP NOP TFO_COOKIE(kind=34, len=6, 4-byte cookie)`).
-  Net per-packet growth: **+20 bytes**.
-- TCP fields: `seq = random()`, `ack_seq = 0`, `doff = 7`, `SYN = 1`
-  (no ACK), `window = 0xFFFF`, `urg_ptr = 0`. Source/dest ports copied
-  from the original UDP header.
-- TFO cookie option (RFC 7413, kind 34) carries a 4-byte marker that
-  identifies the packet as ours on the receiver side: either a fixed
-  sentinel `0xC07F0001` (default, no `--key`), or
-  `siphash24(key, saddr ‖ daddr)[0..4)` (when `--key` is given).
-- IP `protocol` rewritten from 17 (UDP) to 6 (TCP). IP and TCP
-  checksums fully recomputed (full recompute, not incremental, since
-  L4 protocol shape changed).
+| WG type | Size | TCP flags | TCP doff | Net growth |
+|---|---:|---|---:|---:|
+| 1 (initiation) | 148 B | `SYN`     | 7 (with TFO opt) | +20 B |
+| 2 (response)   |  92 B | `SYN+ACK` | 7 (with TFO opt) | +20 B |
+| 3 (cookie)     |  64 B | `SYN+ACK` | 7 (with TFO opt) | +20 B |
+| 4 (transport)  |   ≥16 B | `PSH+ACK` | 5 (no opts) | +12 B |
 
-The wire packet is RFC-compliant TCP — TFO SYNs legitimately carry data
-per RFC 7413 — so stateful firewalls / NAT helpers / SPI middleboxes
-that do TCP-flag inspection accept the packet.
+`seq` / `ack_seq` are derived from the `sender_index` /
+`receiver_index` fields in the WG payload via SipHash-2-4 with a
+fixed 4-byte role tag — both ends compute the same values
+independently:
 
-**Decode (fake TCP SYN → UDP):**
+```
+SYN.seq         = H(K, init.sender_index,   "init")
+SYN+ACK.seq     = H(K, resp.sender_index,   "resp")
+SYN+ACK.ack_seq = H(K, init.sender_index,   "init") + 1 + 148
+                                                      ^^^^^^
+                       (SYN consumes 1) + (TFO data carried in SYN)
 
-- Match: `iph->protocol == TCP`, `tcph->doff >= 7`, `SYN=1 ACK=0`,
-  TFO cookie option present and matches the configured marker.
-- If any check fails: `XT_CONTINUE`. The kernel TCP stack then handles
-  the packet normally (which typically means RST for a non-listening
-  port — the right behaviour for a real probe).
-- If all checks pass: strip the TCP header, write a fresh UDP header
-  in its place (sport/dport copied from TCP), shrink the skb by the
-  TCP-vs-UDP delta, rewrite `iph->protocol = UDP`, recompute checksums.
+cookie.seq      = H(K, recv_idx,            "cook")
+cookie.ack_seq  = H(K, recv_idx,            "init") + 1 + 148
+
+PSH+ACK.seq     = H(K, recv_idx,            "tx  ") + counter_lo32
+PSH+ACK.ack_seq = H(K, recv_idx,            "rx  ")
+```
+
+The SYN+ACK's `ack_seq` matches the SYN's `seq + 1 + 148` exactly,
+so stateful firewalls observe a valid handshake and register the
+flow as ESTABLISHED before the first PSH+ACK arrives.
+
+**Encode steps** (per packet):
+
+- Read first byte of UDP payload → WG type. Reject non-WG (`XT_CONTINUE`).
+- Read `sender_index` / `receiver_index` from the matching WG struct
+  in `wg.h`.
+- Compute seq / ack_seq via the table above (or `random()` in unkeyed
+  mode using a fixed default key for determinism).
+- Strip the 8-byte UDP header, push the appropriate TCP header (20 or
+  28 bytes), copy the original payload as TCP data.
+- For SYN-bearing packets: append `NOP NOP TFO_COOKIE(kind=34, len=6,
+  4-byte cookie)`. The 4-byte cookie is the marker used by the
+  decoder: either a fixed sentinel `0xC07F0001` (default, no `--key`),
+  or `siphash24(key, saddr ‖ daddr)[0..4)` (when `--key` is given).
+- Rewrite IP `protocol` from 17 (UDP) to 6 (TCP). Full IP + TCP
+  checksum recompute (not incremental, since L4 protocol shape
+  changed).
+
+**Decode steps:**
+
+- Match `iph->protocol == TCP`, dispatch on TCP flags:
+  - `SYN` (any ACK): require TFO cookie option matching the configured
+    marker. If absent or mismatched: `XT_CONTINUE` (lets kernel TCP
+    stack RST real probes).
+  - `PSH+ACK` / bare `ACK`: no TFO cookie expected; rely on rule-level
+    peer-IP/port filtering as the marker.
+  - `RST` / `FIN` / other: `XT_CONTINUE` (leave for kernel TCP stack).
+- For matched packets: read the TCP header length from `tcph->doff`,
+  strip the TCP header, write a fresh UDP header (sport/dport copied
+  from TCP), shrink the skb by `tcp_hdr_len - 8`, rewrite `iph->protocol
+  = UDP`, recompute checksums.
 
 ### Hook placement — load-bearing detail
 
@@ -357,25 +397,32 @@ client happens to connect to the same port.
 On the **client** (encoder side):
 
 ```shell
-# Encode outbound: WG datagrams to peer:port → TCP SYNs+TFO
+# Encode outbound: WG datagrams to peer:port → fake TCP (shape chosen
+# by the kernel module from the WG message-type byte)
 iptables -t mangle -A OUTPUT -p udp -d <peer> --dport 51821 \
   -j WGPTCP --encode --key 0123456789abcdef0123456789abcdef
 
-# Decode inbound: TCP SYNs from peer:port → UDP, BEFORE conntrack
-iptables -t raw -A PREROUTING -p tcp -s <peer> --sport 51821 --syn \
+# Decode inbound: any TCP from peer:port → UDP, BEFORE conntrack.
+# No `--syn` filter: the encoder produces SYN, SYN+ACK, AND PSH+ACK
+# packets. The decoder dispatches on TCP flags internally and validates
+# a TFO cookie marker for SYN-set packets; PSH+ACK transport packets
+# rely on the rule's peer IP/port filter as their marker.
+iptables -t raw -A PREROUTING -p tcp -s <peer> --sport 51821 \
   -j WGPTCP --decode --key 0123456789abcdef0123456789abcdef
 ```
 
 On the **server** (decoder side, mirror image): swap source/dest and
-sport/dport in the same two rules. For site-to-site shapes where both
-ends initiate, install both encode and decode on each side.
+sport/dport in the same two rules. WG is symmetric — either side may
+send type-1 (initiation) for a fresh handshake — so install both
+encode and decode on each side regardless of who initiates.
 
 ### MTU
 
-Per-packet overhead is +20 bytes. WireGuard's default MTU 1420 fits in
-a 1500-byte underlay (1440 ≤ 1500). On tighter underlays (1280, IPv6-
-only links, PPPoE), lower the WG MTU accordingly with
-`MTU = <underlay-mtu> - 80` (60 IP+TCP+TFO header + 20 WG transport).
+Handshake packets grow by +20 B; transport packets grow by +12 B.
+Worst case is +20 B. WireGuard's default MTU 1420 fits in a 1500-byte
+underlay (1440 ≤ 1500). On tighter underlays (1280, IPv6-only links,
+PPPoE), lower the WG MTU accordingly: `MTU ≤ <underlay-mtu> - 80`
+(60 = IP + TCP-with-TFO header; 20 = WG transport overhead).
 
 ### Operational notes
 
@@ -389,14 +436,21 @@ only links, PPPoE), lower the WG MTU accordingly with
   Real fake-TCP packets still rewrite at `raw` PREROUTING before
   reaching the kernel TCP stack, so the listener never sees them.
 
-- **No per-flow state, no handshake**. This is *stateless* fake-TCP:
-  every packet is an independent SYN with a randomly stamped seq.
-  Survives stateless firewalls and TCP-flag DPI. Will NOT survive
-  deep TCP-state-aware firewalls that demand a real ESTABLISHED
-  transition. For that, either upgrade to a userspace tool with
-  handshake state (udp2raw `--seq-mode 3`), or extend this module
-  with a `nf_conntrack_extend` per-flow seq counter (see the parent
-  repo's plan for sketching).
+- **No per-flow state**. Even though the wire shape reproduces a
+  3-way handshake, there's no kernel-side flow tracking — every
+  packet's TCP fields are derived purely from its own contents +
+  the shared `--key`. This survives:
+  - stateless firewalls and TCP-flag DPI;
+  - **stateful firewalls with default-loose mode** (most common; e.g.
+    Linux netfilter conntrack with `nf_conntrack_tcp_loose=1`, the
+    default), which validate the SYN/SYN+ACK pairing and then accept
+    PSH+ACK seq within a generous receive window.
+  Won't survive **strict** stateful firewalls that demand monotonic
+  per-byte seq advancement across the handshake→data boundary
+  (rare in practice). For that, either upgrade to a userspace tool
+  with full handshake state (udp2raw `--seq-mode 3`), or extend this
+  module with a `nf_conntrack_extend` per-flow seq counter (see the
+  parent repo's plan for sketching).
 
 - **Co-existing with `WGANYCAST` / conntrack-DNAT**: same gotcha as
   WGANYCAST — if a `nat`-table DNAT rule for the same `(dest, port)`
