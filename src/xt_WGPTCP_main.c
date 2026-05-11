@@ -44,6 +44,7 @@
 #include <net/ip.h>
 #include <net/tcp.h>
 #include <net/udp.h>
+#include <net/netfilter/nf_conntrack.h>
 #include "xt_WGPTCP.h"
 #include "wg.h"
 #include "xt_wg_common.h"
@@ -87,14 +88,32 @@ struct wg_message_transport_min {
 
 /* Domain-separator strings for SipHash inputs (4 ASCII bytes each).
  * Both ends use the same strings so derived values match.
+ *
+ * v2 uses just two roles — one for outbound seq base (keyed on
+ * iph->saddr, stable across re-handshakes for one host's outbound),
+ * and one for outbound ack_seq (keyed on iph->daddr, which mirrors
+ * the peer's seq base from their POV).
  */
-#define ROLE_INIT	"init"	/* SYN seq for type-1 initiator */
-#define ROLE_RESP	"resp"	/* SYN+ACK seq for type-2 responder */
-#define ROLE_COOK	"cook"	/* SYN+ACK seq for type-3 cookie reply */
-#define ROLE_TX		"tx  "	/* PSH+ACK seq base (outbound counter) */
-#define ROLE_RX		"rx  "	/* PSH+ACK ack_seq base (inbound counter) */
+#define ROLE_OUT	"out "	/* outbound seq base */
+#define ROLE_ACK	"ack "	/* outbound ack_seq base (= peer's seq base + 149) */
 
 #define WGPTCP_INIT_TFO_DATA_LEN	148u	/* size of WG handshake initiation */
+
+/* `ct->mark` stores OUTBOUND state for this flow on this host:
+ *   0       = no outbound packet emitted yet on this conntrack entry.
+ *             Next encode emits SYN (initiator) or SYN+ACK (responder).
+ *   1       = SYN/SYN+ACK has been emitted; no PSH+ACK data yet.
+ *             cum_bytes (post-handshake PSH+ACK payload) = 0.
+ *   1 + N   = N bytes of PSH+ACK payload have been emitted since the
+ *             initial SYN/SYN+ACK.
+ *
+ * Lifetime is bound to the conntrack entry — when WG goes silent past
+ * the UDP-conntrack timeout, the entry ages out, mark vanishes with
+ * it, and the next outbound packet starts a fresh SYN. Re-handshakes
+ * inside the conntrack lifetime don't touch the mark sentinel; they
+ * just contribute their payload to cum_bytes, riding as PSH+ACK.
+ */
+#define WGPTCP_MARK_INITIAL_SENTINEL	1u
 
 /* Default key for unkeyed mode — used so derived values are deterministic
  * across encoder/decoder pairs even without a user-supplied --key. The
@@ -257,7 +276,21 @@ static unsigned int wgptcp_encode_common(struct sk_buff *skb,
 }
 
 /* --------------------------------------------------------------------
- *   ENCODE — dispatch on WG message type
+ *   ENCODE — flow-state-driven via ct->mark + ctinfo (v2)
+ *
+ * The WG message-type byte is parsed only for size validation
+ * (defensive: don't TCP-wrap arbitrary non-WG UDP).  Wire-shape
+ * selection (SYN / SYN+ACK / PSH+ACK) comes from the conntrack
+ * state, not from the WG type:
+ *
+ *   mark == 0 + ctinfo == IP_CT_NEW             → SYN
+ *   mark == 0 + ctinfo == IP_CT_ESTABLISHED_REPLY → SYN+ACK
+ *   mark >= 1                                    → PSH+ACK
+ *
+ * This makes re-handshakes (further type=1 INITs on the same
+ * conntrack entry) ride as PSH+ACK with cumulative seq — the in-path
+ * middlebox sees an uninterrupted ESTABLISHED stream and never
+ * sees a SYN→ESTABLISHED transition to dislike.
  * -------------------------------------------------------------------- */
 static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 				     const struct xt_wgptcp_info *info)
@@ -270,6 +303,9 @@ static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 	__be32	 seq = 0, ack_seq = 0;
 	u8	 flags;
 	unsigned int tcp_hdr_len;
+	struct nf_conn *ct;
+	enum ip_conntrack_info ctinfo;
+	u32	 syn_seq_base, ack_seq_base, mark;
 
 	iph = ip_hdr(skb);
 	if (iph->protocol != IPPROTO_UDP)
@@ -290,80 +326,82 @@ static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 	if (payload_len < 4)
 		return XT_CONTINUE;
 
+	/* Validate the WG message type + size.  Defensive: only TCP-wrap
+	 * well-formed WG packets.
+	 */
 	wg_type = payload[0];
 	switch (wg_type) {
-	case WG_TYPE_INIT: {
-		const struct wg_message_handshake_initiation *m;
-
-		if (payload_len != sizeof(*m))
+	case WG_TYPE_INIT:
+		if (payload_len != sizeof(struct wg_message_handshake_initiation))
 			return XT_CONTINUE;
-		m = (const void *)payload;
-
-		flags       = TCPHDR_SYN;
-		tcp_hdr_len = WGPTCP_TCP_HDR_HS;
-		seq         = (__force __be32)cpu_to_be32(
-				wgptcp_derive(info, m->sender_index, ROLE_INIT));
-		ack_seq     = 0;
 		break;
-	}
-	case WG_TYPE_RESP: {
-		const struct wg_message_handshake_response *m;
-
-		if (payload_len != sizeof(*m))
+	case WG_TYPE_RESP:
+		if (payload_len != sizeof(struct wg_message_handshake_response))
 			return XT_CONTINUE;
-		m = (const void *)payload;
-
-		flags       = TCPHDR_SYN | TCPHDR_ACK;
-		tcp_hdr_len = WGPTCP_TCP_HDR_HS;
-		seq         = (__force __be32)cpu_to_be32(
-				wgptcp_derive(info, m->sender_index, ROLE_RESP));
-		/* ACK the prior SYN: peer's seq + 1 (SYN consumes 1) +
-		 * 148 (TFO data carried in initiator's SYN). */
-		ack_seq     = (__force __be32)cpu_to_be32(
-				wgptcp_derive(info, m->receiver_index, ROLE_INIT)
-				+ 1 + WGPTCP_INIT_TFO_DATA_LEN);
 		break;
-	}
-	case WG_TYPE_COOKIE: {
-		const struct wg_message_handshake_cookie *m;
-
-		if (payload_len != sizeof(*m))
+	case WG_TYPE_COOKIE:
+		if (payload_len != sizeof(struct wg_message_handshake_cookie))
 			return XT_CONTINUE;
-		m = (const void *)payload;
-
-		flags       = TCPHDR_SYN | TCPHDR_ACK;
-		tcp_hdr_len = WGPTCP_TCP_HDR_HS;
-		/* Cookie reply has no own sender_index — derive seq from
-		 * receiver_index with a different role tag so it doesn't
-		 * collide with a normal type-2 response on the same flow. */
-		seq         = (__force __be32)cpu_to_be32(
-				wgptcp_derive(info, m->receiver_index, ROLE_COOK));
-		ack_seq     = (__force __be32)cpu_to_be32(
-				wgptcp_derive(info, m->receiver_index, ROLE_INIT)
-				+ 1 + WGPTCP_INIT_TFO_DATA_LEN);
 		break;
-	}
-	case WG_TYPE_DATA: {
-		const struct wg_message_transport_min *m;
-		u32 ctr_lo;
-
-		if (payload_len < sizeof(*m))
+	case WG_TYPE_DATA:
+		if (payload_len < sizeof(struct wg_message_transport_min))
 			return XT_CONTINUE;
-		m = (const void *)payload;
-
-		flags       = TCPHDR_PSH | TCPHDR_ACK;
-		tcp_hdr_len = WGPTCP_TCP_HDR_DATA;
-		ctr_lo      = (u32)le64_to_cpu(m->counter);
-		seq         = (__force __be32)cpu_to_be32(
-				wgptcp_derive(info, m->receiver_index, ROLE_TX)
-				+ ctr_lo);
-		ack_seq     = (__force __be32)cpu_to_be32(
-				wgptcp_derive(info, m->receiver_index, ROLE_RX));
 		break;
-	}
 	default:
 		return XT_CONTINUE;
 	}
+
+	/* Seq base for our outbound: stateless derivation keyed on our
+	 * pre-NAT local IP.  Encoder runs before POSTROUTING SNAT, so
+	 * iph->saddr is the canonical local address regardless of any
+	 * upstream NAT.  Same base across re-handshakes and across
+	 * different WG message types within one flow → continuous seq
+	 * advancement for any middlebox tracking the flow.
+	 */
+	syn_seq_base = wgptcp_derive(info, iph->saddr, ROLE_OUT);
+	ack_seq_base = wgptcp_derive(info, iph->daddr, ROLE_OUT);
+
+	ct = nf_ct_get(skb, &ctinfo);
+	mark = ct ? READ_ONCE(ct->mark) : 0;
+
+	if (mark == 0) {
+		/* First outbound packet on this conntrack entry. */
+		if (!ct || ctinfo == IP_CT_NEW) {
+			/* We initiated this flow — emit a SYN with TFO data. */
+			flags   = TCPHDR_SYN;
+			ack_seq = 0;
+		} else {
+			/* Peer initiated — emit SYN+ACK with TFO data, acking
+			 * the peer's prior SYN. */
+			flags   = TCPHDR_SYN | TCPHDR_ACK;
+			ack_seq = (__force __be32)cpu_to_be32(
+				ack_seq_base + 1 + WGPTCP_INIT_TFO_DATA_LEN);
+		}
+		seq         = (__force __be32)cpu_to_be32(syn_seq_base);
+		tcp_hdr_len = WGPTCP_TCP_HDR_HS;
+		if (ct)
+			WRITE_ONCE(ct->mark, WGPTCP_MARK_INITIAL_SENTINEL);
+	} else {
+		/* ESTABLISHED — every subsequent outbound packet (including
+		 * WG re-handshakes) rides as PSH+ACK with cumulative seq.
+		 * Stationary ack_seq (= peer's SYN seq + 149) — looks like a
+		 * "duplicate ACK" pattern; loose-mode middleboxes accept.
+		 */
+		u32 cum_bytes = mark - WGPTCP_MARK_INITIAL_SENTINEL;
+
+		flags       = TCPHDR_PSH | TCPHDR_ACK;
+		seq         = (__force __be32)cpu_to_be32(
+				syn_seq_base + 1 + WGPTCP_INIT_TFO_DATA_LEN
+				+ cum_bytes);
+		ack_seq     = (__force __be32)cpu_to_be32(
+				ack_seq_base + 1 + WGPTCP_INIT_TFO_DATA_LEN);
+		tcp_hdr_len = WGPTCP_TCP_HDR_DATA;
+		WRITE_ONCE(ct->mark, mark + payload_len);
+	}
+
+	/* Suppress unused-var warning if wg_type ends up unused after the
+	 * size-validation switch (no per-type seq derivation in v2). */
+	(void)wg_type;
 
 	/* Optional WGOBFS-style payload mangling — applied while skb is
 	 * still UDP-shaped, so wg_obfs_payload's `udp_hdr(skb)` access
