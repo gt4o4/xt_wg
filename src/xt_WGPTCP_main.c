@@ -64,27 +64,47 @@ struct wg_message_transport_min {
 	__le64 counter;
 };
 
-/* TCP option layout for handshake-shape encoding (8 bytes appended to the
- * 20-byte TCP base header):
+/* TCP option layout (v2 — full Linux SYN option set + TS on data):
  *
- *	bytes 0..1: NOP NOP	(kind=1, 4-byte alignment pad)
- *	bytes 2..3: TFO_COOKIE	(kind=34, len=6)
- *	bytes 4..7: 4-byte cookie value
+ *   SYN / SYN+ACK (handshake shape):  28 B of options
+ *     MSS(4) | SACK_Perm(2) TS(10) | NOP WSCALE(3) | NOP NOP TFO(6) = 28 B
+ *     TCP header total = 20 + 28 = 48 B  →  doff = 12  →  +40 B vs UDP
+ *
+ *   PSH+ACK (data shape):              12 B of options
+ *     NOP NOP TS(10) = 12 B
+ *     TCP header total = 20 + 12 = 32 B  →  doff = 8  →  +24 B vs UDP
+ *
+ * Stock Linux's `tcp_options_write` packs SACK_Perm directly before
+ * the TS option (no NOP between) so the option block matches what a
+ * fresh Linux client would emit — fingerprinting middleboxes see no
+ * difference from a real TCP handshake.
  */
-#define WGPTCP_TFO_OPTS_LEN	8u
-#define WGPTCP_TCP_HDR_HS	(sizeof(struct tcphdr) + WGPTCP_TFO_OPTS_LEN)	/* 28 */
-#define WGPTCP_DOFF_HS		(WGPTCP_TCP_HDR_HS / 4)				/* 7 */
-#define WGPTCP_DELTA_HS		(WGPTCP_TCP_HDR_HS - sizeof(struct udphdr))	/* +20 */
+#define WGPTCP_HS_OPTS_LEN	28u
+#define WGPTCP_TCP_HDR_HS	(sizeof(struct tcphdr) + WGPTCP_HS_OPTS_LEN)	/* 48 */
+#define WGPTCP_DOFF_HS		(WGPTCP_TCP_HDR_HS / 4)				/* 12 */
+#define WGPTCP_DELTA_HS		(WGPTCP_TCP_HDR_HS - sizeof(struct udphdr))	/* +40 */
 
-#define WGPTCP_TCP_HDR_DATA	sizeof(struct tcphdr)				/* 20 */
-#define WGPTCP_DOFF_DATA	(WGPTCP_TCP_HDR_DATA / 4)			/* 5 */
-#define WGPTCP_DELTA_DATA	(WGPTCP_TCP_HDR_DATA - sizeof(struct udphdr))	/* +12 */
+#define WGPTCP_DATA_OPTS_LEN	12u
+#define WGPTCP_TCP_HDR_DATA	(sizeof(struct tcphdr) + WGPTCP_DATA_OPTS_LEN)	/* 32 */
+#define WGPTCP_DOFF_DATA	(WGPTCP_TCP_HDR_DATA / 4)			/* 8 */
+#define WGPTCP_DELTA_DATA	(WGPTCP_TCP_HDR_DATA - sizeof(struct udphdr))	/* +24 */
 
-/* TCP option kinds */
+/* TCP option kinds (RFC 9293 / 7323 / 2018 / 7413) */
 #define WGPTCP_TCPOPT_EOL	0u
 #define WGPTCP_TCPOPT_NOP	1u
+#define WGPTCP_TCPOPT_MSS	2u
+#define WGPTCP_TCPOPT_WSCALE	3u
+#define WGPTCP_TCPOPT_SACK_PERM	4u
+#define WGPTCP_TCPOPT_TS	8u
 #define WGPTCP_TCPOPT_TFO	34u
+#define WGPTCP_TCPOPT_MSS_LEN	4u
+#define WGPTCP_TCPOPT_WSCALE_LEN 3u
+#define WGPTCP_TCPOPT_SACK_PERM_LEN 2u
+#define WGPTCP_TCPOPT_TS_LEN	10u
 #define WGPTCP_TCPOPT_TFO_LEN	6u
+
+#define WGPTCP_DEFAULT_MSS	1460u
+#define WGPTCP_DEFAULT_WSCALE	7u	/* matches stock Linux tcp_select_initial_window */
 
 /* Domain-separator strings for SipHash inputs (4 ASCII bytes each).
  * Both ends use the same strings so derived values match.
@@ -197,7 +217,6 @@ static unsigned int wgptcp_encode_common(struct sk_buff *skb,
 	struct tcphdr *tcph;
 	u8	*opts;
 	__be16	 sport, dport;
-	__be32	 cookie;
 	unsigned int ihl, payload_len, tcp_total_len, delta;
 
 	iph = ip_hdr(skb);
@@ -242,22 +261,67 @@ static unsigned int wgptcp_encode_common(struct sk_buff *skb,
 	tcph->ack	= !!(tcp_flags & TCPHDR_ACK);
 	tcph->window	= htons(0xFFFFu);
 
-	/* TFO cookie option only appended for the handshake-shape (28-byte
-	 * header).  PSH+ACK data shape has no options.
+	/* TCP options — full stock-Linux SYN set on handshake-shape
+	 * (matches what `tcp_options_write` would emit for a fresh
+	 * Linux TCP client + server) so fingerprinting middleboxes see
+	 * an indistinguishable handshake; TS-only on PSH+ACK data
+	 * (matches stock Linux ESTABLISHED data flows).
+	 *
+	 *   handshake (28 B):
+	 *     [MSS(4)] [SACK_Perm(2) TS(10)] [NOP WSCALE(3)] [NOP NOP TFO(6)]
+	 *
+	 *   data (12 B):
+	 *     [NOP NOP TS(10)]
 	 */
+	opts = (u8 *)tcph + sizeof(struct tcphdr);
 	if (tcp_hdr_len == WGPTCP_TCP_HDR_HS) {
-		opts    = (u8 *)tcph + sizeof(struct tcphdr);
+		u32 ts_val = tcp_time_stamp_raw();
+		__be32 cookie_v;
+
+		/* MSS (4 B): kind=2 len=4 value=1460 */
+		opts[0] = WGPTCP_TCPOPT_MSS;
+		opts[1] = WGPTCP_TCPOPT_MSS_LEN;
+		*(__be16 *)(opts + 2) = htons(WGPTCP_DEFAULT_MSS);
+
+		/* SACK_Perm + TS (12 B): packed together, matching Linux's
+		 *   tcp_options_write when both options are present.
+		 *     [SACK_Perm kind=4 len=2] [TS kind=8 len=10] [val(4)] [ecr(4)]
+		 */
+		opts[4]  = WGPTCP_TCPOPT_SACK_PERM;
+		opts[5]  = WGPTCP_TCPOPT_SACK_PERM_LEN;
+		opts[6]  = WGPTCP_TCPOPT_TS;
+		opts[7]  = WGPTCP_TCPOPT_TS_LEN;
+		*(__be32 *)(opts +  8) = htonl(ts_val);
+		*(__be32 *)(opts + 12) = 0;	/* TS_ecr = 0 (no peer tracking) */
+
+		/* NOP + WSCALE (4 B): kind=3 len=3 shift=7 */
+		opts[16] = WGPTCP_TCPOPT_NOP;
+		opts[17] = WGPTCP_TCPOPT_WSCALE;
+		opts[18] = WGPTCP_TCPOPT_WSCALE_LEN;
+		opts[19] = WGPTCP_DEFAULT_WSCALE;
+
+		/* NOP NOP + TFO cookie (8 B): kind=34 len=6 cookie(4) */
+		opts[20] = WGPTCP_TCPOPT_NOP;
+		opts[21] = WGPTCP_TCPOPT_NOP;
+		opts[22] = WGPTCP_TCPOPT_TFO;
+		opts[23] = WGPTCP_TCPOPT_TFO_LEN;
+		/* tcph->seq is already populated above and is derived from
+		 * the WG payload (via ROLE_OUT siphash) — the cookie is a
+		 * hash of seq, NAT-immune since TCP seq is preserved by
+		 * any conventional NAT.
+		 */
+		cookie_v = wgptcp_cookie(info, tcph->seq);
+		memcpy(opts + 24, &cookie_v, 4);
+	} else {
+		/* PSH+ACK: NOP NOP + TS only (12 B) */
+		u32 ts_val = tcp_time_stamp_raw();
+
 		opts[0] = WGPTCP_TCPOPT_NOP;
 		opts[1] = WGPTCP_TCPOPT_NOP;
-		opts[2] = WGPTCP_TCPOPT_TFO;
-		opts[3] = WGPTCP_TCPOPT_TFO_LEN;
-		/* tcph->seq is already populated above and encodes a
-		 * SipHash of the WG sender_index — derive the cookie from
-		 * it so the marker travels with the (NAT-immune) seq value
-		 * rather than the (NAT-mutable) iph addresses.
-		 */
-		cookie  = wgptcp_cookie(info, tcph->seq);
-		memcpy(opts + 4, &cookie, 4);
+		opts[2] = WGPTCP_TCPOPT_TS;
+		opts[3] = WGPTCP_TCPOPT_TS_LEN;
+		*(__be32 *)(opts + 4) = htonl(ts_val);
+		*(__be32 *)(opts + 8) = 0;
 	}
 
 	iph->protocol = IPPROTO_TCP;
