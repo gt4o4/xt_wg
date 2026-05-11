@@ -4,8 +4,9 @@
  *
  * xt_WGPTCP — shared header (kernel + userspace)
  *
- * UDP↔fake-TCP transmutation for WireGuard-over-DPI. Per-flow state
- * lives in ct->mark of the underlying UDP conntrack entry.
+ * UDP↔fake-TCP transmutation for WireGuard-over-DPI.  Per-direction
+ * byte/packet state is read from `nf_conn_acct` on the underlying
+ * UDP conntrack entry (no `ct->mark` or `ct->labels` claim).
  *
  *   ENCODE — rewrite outbound UDP packet to a TCP SYN that carries the
  *            UDP payload as TCP data, with a TFO cookie option (RFC 7413)

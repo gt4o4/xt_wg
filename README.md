@@ -15,10 +15,11 @@ across hostile or asymmetric networks:
   enumeration at the rule level — pool entries are learned from
   observed inbound WG traffic and self-reap via standard conntrack
   GC at WG `REJECT_AFTER_TIME + 20 s`.
-- **`WGPTCP`** — UDP↔fake-TCP transmutation with stateful flow tracking
-  via `ct->mark`. Reproduces a textbook Linux TCP handshake +
+- **`WGPTCP`** — UDP↔fake-TCP transmutation with stateful flow
+  tracking via `nf_conn_acct` (the kernel's per-direction byte+packet
+  counter extension).  Reproduces a textbook Linux TCP handshake +
   ESTABLISHED data stream so middleboxes that block or rate-limit UDP
-  let the flow through. Re-handshakes ride as PSH+ACK on the same
+  let the flow through.  Re-handshakes ride as PSH+ACK on the same
   conntrack entry — the middlebox sees one uninterrupted ESTABLISHED
   stream and never observes a SYN→ESTABLISHED transition.
 
@@ -203,6 +204,50 @@ by the conntrack hashtable.  Port-translation by the gateway (e.g.
 anycast:59263 → backend:51821 in CF Spectrum) is learned implicitly
 because the expectation captures the observed source `(ip, port)`.
 
+### Diagnostics
+
+Anchors and pool entries are visible through standard conntrack
+introspection — no module-specific procfs file.
+
+```shell
+# Per-session anchors: `dport=0` is the synthetic-tuple signature.
+# `src=<Sa.ip>` is our local WG endpoint, `dst=<idx_as_ip>` decodes to
+# the session index (little-endian).  `[ASSURED]` flag is set.
+grep 'dport=0.*\[ASSURED\]' /proc/net/nf_conntrack
+
+# Permanent expectations under those anchors = current pool entries.
+# Each line is one anycast door learned for one session.
+cat /proc/net/nf_conntrack_expect
+
+# Children — real WG flows linked to an anchor via expectation match.
+# These are the actual UDP flows; one per (session, anycast door).
+grep -F 'EXPECTED' /proc/net/nf_conntrack | grep "dport=$listenPort"
+
+# The no-op helper bookkeeping.
+cat /proc/net/nf_conntrack_helpers | grep WGANYCAST
+```
+
+Reading the `dst=<idx_as_ip>` field: convert four octets back to a
+32-bit value to get the session index.  Useful for correlating with
+`wg show <iface> peers` output (the `latest-handshake` peer also
+exposes its session index via `wg show <iface> all` on newer
+`wireguard-tools`).
+
+If the SPRAY pool stays empty after multiple peer connections,
+check:
+
+1. **LEARN rule is in `raw` PREROUTING and BEFORE conntrack** —
+   priority must be ≤ −300.  Verify with
+   `iptables -t raw -L PREROUTING -n -v --line-numbers`.
+2. **WG packets actually arrive** — `tcpdump -i <wan> udp port <listenPort>`
+   on the host should show inbound RESP/DATA from anycast doors.
+3. **No iptables `-j DROP` upstream of the LEARN rule** — even
+   stoppage in `mangle` PREROUTING is too late if it precedes the
+   `raw` table's `-j DROP`, but `raw` itself is first.
+4. **Anchor exists but expectations don't refresh** — check that
+   `nf_conntrack_acct` is enabled (`sysctl net.netfilter.nf_conntrack_acct`)
+   and that no `-j NOTRACK` rule is shadowing the WG flow.
+
 ### Notes
 
 - **Synthetic-tuple collision-free**: anchor tuples have
@@ -224,6 +269,8 @@ because the expectation captures the observed source `(ip, port)`.
 - **Pre-v3 `--dest` / `--canonical` are gone**.  The static pool
   enumeration and source-canonicalisation are replaced by dynamic
   learning + the synthetic-tuple-anchor mechanism.
+- **IPv4 only.**  Same constraint as WGPTCP; IPv6 support would
+  need parallel paths in the anchor / expectation tuple builders.
 
 
 ## WGPTCP
@@ -262,17 +309,17 @@ stream and never observes a SYN→ESTABLISHED transition. This is the
 v2 fix for the v1.5 failure mode (Cloudflare-Spectrum-style strict
 middleboxes dropping the re-handshake's fresh SYN as out-of-window).
 
-**Stuck-flow recovery:** if `ct->mark > 0` but `IPS_SEEN_REPLY` is
-still unset — i.e., we've sent at least one SYN/SYN+ACK but no return
-packet has ever come back — the middlebox on the return path
-probably dropped our handshake without opening flow state. The
-encoder re-fires a fresh SYN on every WG type=1 INIT. WG itself
+**Stuck-flow recovery:** if `own_packets > 1` (we've sent at least
+one prior outbound) but `IPS_SEEN_REPLY` is still unset — i.e., no
+return packet has ever come back — the middlebox on the return path
+probably dropped our handshake without opening flow state.  The
+encoder re-fires a fresh SYN on every WG type=1 INIT.  WG itself
 drives the cadence (`REKEY_TIMEOUT = 5 s`, capped at
 `REKEY_ATTEMPT_TIME = 90 s`), so worst case is ~18 SYN retransmits
-before WG gives up. Once any reply lands and `IPS_SEEN_REPLY` flips,
-the encoder drops back to PSH+ACK. `ct->mark` stays intact during
-refire so cum_bytes accounting is correct for the post-recovery
-stream.
+before WG gives up.  Once any reply lands and `IPS_SEEN_REPLY` flips,
+the encoder drops back to PSH+ACK.  Accounting counters keep
+incrementing through the refire so cum_bytes math is correct for
+the post-recovery stream.
 
 The recovery condition fires only on the **originator** side. On the
 responder, `IPS_SEEN_REPLY` flips to true the moment the first

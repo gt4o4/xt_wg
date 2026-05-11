@@ -6,7 +6,8 @@
  * targets:
  *
  *   - WGOBFS    — chacha-keyed payload obfuscation
- *   - WGANYCAST — stateless per-packet UDP destination spray
+ *   - WGANYCAST — WG-protocol-aware dynamic anycast pool learning,
+ *                 conntrack-as-registry (LEARN / SPRAY)
  *   - WGPTCP    — WG-protocol-aware UDP↔fake-TCP transmutation
  *
  * Each target's xt_target[] array lives in its own translation unit
