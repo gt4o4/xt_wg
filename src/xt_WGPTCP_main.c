@@ -54,11 +54,7 @@
 #include "wg.h"
 #include "xt_wg_common.h"
 
-/* WG message-type byte values (first byte of UDP payload). */
-#define WG_TYPE_INIT	0x01u
-#define WG_TYPE_RESP	0x02u
-#define WG_TYPE_COOKIE	0x03u
-#define WG_TYPE_DATA	0x04u
+/* WG message-type byte values: see WG_TYPE_* in xt_wg_common.h */
 
 /* WG transport-data header (not in wg.h — defined per WG spec):
  *   __le32 type  + __le32 receiver_index + __le64 counter + ciphertext...

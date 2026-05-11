@@ -2,126 +2,85 @@
 /*
  * Author: Bingchen Gong <gongbingchen@gmail.com>
  *
- * iptables WGANYCAST target plugin
+ * iptables WGANYCAST target plugin — v3 (LEARN / SPRAY).
+ *
+ * Two modes, no other arguments:
+ *
+ *   --learn   for `raw` PREROUTING.  Observe inbound WG packets,
+ *             register/refresh permanent expectations under a
+ *             per-session anchor conntrack.
+ *
+ *   --spray   for `raw` OUTPUT.  Look up the anchor by WG receiver
+ *             index, pick a random anycast door from the anchor's
+ *             expectations, rewrite iph->daddr (+ udph->dest if the
+ *             entry's port differs).  Empty pool → packet goes to
+ *             WG's configured peer.endpoint as-is.
+ *
+ * Pre-v3 `--dest` / `--canonical` are gone — the door pool is now
+ * dynamic and learned from observed WG handshake/data traffic.
  */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <errno.h>
-#include <getopt.h>
-#include <arpa/inet.h>
 #include <xtables.h>
 #include "xt_WGANYCAST.h"
 
 enum {
-	OPT_DEST = 0,
-	OPT_CANONICAL,
+	OPT_LEARN = 0,
+	OPT_SPRAY,
 };
 
-/* `*flags` bits — tracked per-invocation in xtables_target.parse() so we
- * can detect mutual exclusion / repetition without inspecting `info`
- * (which has SPRAY=0 as a default and would falsely trigger on a
- * freshly-zeroed struct).
- */
-#define F_SPRAY     (1u << 0)
-#define F_CANONICAL (1u << 1)
+#define F_LEARN	(1u << 0)
+#define F_SPRAY	(1u << 1)
 
 static const struct option wganycast_opts[] = {
-	{ .name = "dest",      .has_arg = true, .val = OPT_DEST },
-	{ .name = "canonical", .has_arg = true, .val = OPT_CANONICAL },
+	{ .name = "learn", .has_arg = false, .val = OPT_LEARN },
+	{ .name = "spray", .has_arg = false, .val = OPT_SPRAY },
 	{}
 };
 
 static void wganycast_help(void)
 {
 	printf("WGANYCAST target options:\n"
-	       "    --dest <ip>[:<port>]      spray packets to this IP[:port]\n"
-	       "                              (repeat for pool, max %d entries)\n"
-	       "    --canonical <ip>[:<port>] rewrite source IP[:port] to this\n"
+	       "    --learn    observe inbound WG packets and learn the anycast\n"
+	       "               source pool (raw PREROUTING)\n"
+	       "    --spray    rewrite outbound WG dst to a random pool entry\n"
+	       "               for the current session (raw OUTPUT)\n"
 	       "\n"
-	       "  Port is optional; when omitted, the packet's existing port is\n"
-	       "  preserved. --dest is for OUTPUT/POSTROUTING (per-packet random\n"
-	       "  destination selection across the pool). --canonical is for\n"
-	       "  PREROUTING (canonicalise replies from any anycast IP back to a\n"
-	       "  single source so WireGuard roaming stays pinned). The two flags\n"
-	       "  are mutually exclusive.\n",
-	       XT_WGANYCAST_MAX_DESTS);
-}
-
-/* Parse "IP" or "IP:PORT" into (addr, port). Returns 0 on success, -1 on
- * bad format. port_out is set to 0 (network-order) when no :port given.
- */
-static int parse_addr_port(const char *s, struct in_addr *addr_out,
-			   __be16 *port_out)
-{
-	char buf[64];
-	char *colon;
-	unsigned long p;
-
-	if (strlen(s) >= sizeof(buf))
-		return -1;
-	strncpy(buf, s, sizeof(buf) - 1);
-	buf[sizeof(buf) - 1] = '\0';
-
-	colon = strrchr(buf, ':');
-	if (colon) {
-		*colon = '\0';
-		p = strtoul(colon + 1, NULL, 10);
-		if (p == 0 || p > 65535)
-			return -1;
-		*port_out = htons((uint16_t)p);
-	} else {
-		*port_out = 0;
-	}
-
-	if (!inet_aton(buf, addr_out))
-		return -1;
-	return 0;
+	       "  Exactly one of --learn or --spray is required.  No pool is\n"
+	       "  configured at the rule level; per-session anchor conntracks\n"
+	       "  encode (Sa, our_idx) / (Sa, peer_idx) and self-reap via\n"
+	       "  standard conntrack GC.  Pool capacity is %u entries per\n"
+	       "  anchor (LRU eviction on overflow).\n",
+	       XT_WGANYCAST_POOL_MAX);
 }
 
 static int wganycast_parse(int c, char **argv, int invert, unsigned int *flags,
 			   const void *entry, struct xt_entry_target **tgt)
 {
 	struct xt_wganycast_info *info = (void *)(*tgt)->data;
-	struct in_addr addr;
-	__be16 port;
 
 	switch (c) {
-	case OPT_DEST:
-		if (*flags & F_CANONICAL)
-			xtables_error(PARAMETER_PROBLEM,
-				"WGANYCAST: --dest and --canonical are mutually exclusive");
-		if (info->ndests >= XT_WGANYCAST_MAX_DESTS)
-			xtables_error(PARAMETER_PROBLEM,
-				"WGANYCAST: too many --dest entries (max %d)",
-				XT_WGANYCAST_MAX_DESTS);
-		if (parse_addr_port(optarg, &addr, &port) < 0)
-			xtables_error(PARAMETER_PROBLEM,
-				"WGANYCAST: bad --dest \"%s\" (expected IP or IP:PORT)",
-				optarg);
-		info->mode = XT_WGANYCAST_MODE_SPRAY;
-		info->dests[info->ndests].ip = addr.s_addr;
-		info->dests[info->ndests].port = port;
-		info->ndests++;
-		*flags |= F_SPRAY;
-		return true;
-
-	case OPT_CANONICAL:
+	case OPT_LEARN:
 		if (*flags & F_SPRAY)
 			xtables_error(PARAMETER_PROBLEM,
-				"WGANYCAST: --dest and --canonical are mutually exclusive");
-		if (*flags & F_CANONICAL)
+				"WGANYCAST: --learn and --spray are mutually exclusive");
+		if (*flags & F_LEARN)
 			xtables_error(PARAMETER_PROBLEM,
-				"WGANYCAST: --canonical can only be specified once");
-		if (parse_addr_port(optarg, &addr, &port) < 0)
+				"WGANYCAST: --learn can only be specified once");
+		info->mode = XT_WGANYCAST_MODE_LEARN;
+		*flags |= F_LEARN;
+		return true;
+
+	case OPT_SPRAY:
+		if (*flags & F_LEARN)
 			xtables_error(PARAMETER_PROBLEM,
-				"WGANYCAST: bad --canonical \"%s\" (expected IP or IP:PORT)",
-				optarg);
-		info->mode = XT_WGANYCAST_MODE_CANONICAL;
-		info->dests[0].ip = addr.s_addr;
-		info->dests[0].port = port;
-		info->ndests = 1;
-		*flags |= F_CANONICAL;
+				"WGANYCAST: --learn and --spray are mutually exclusive");
+		if (*flags & F_SPRAY)
+			xtables_error(PARAMETER_PROBLEM,
+				"WGANYCAST: --spray can only be specified once");
+		info->mode = XT_WGANYCAST_MODE_SPRAY;
+		*flags |= F_SPRAY;
 		return true;
 	}
 
@@ -132,32 +91,18 @@ static void wganycast_check(unsigned int flags)
 {
 	if (!flags)
 		xtables_error(PARAMETER_PROBLEM,
-			"WGANYCAST: --dest or --canonical is required");
-}
-
-static void print_dest(const struct xt_wganycast_dest *d, const char *opt)
-{
-	char buf[INET_ADDRSTRLEN];
-	struct in_addr a = { .s_addr = d->ip };
-	inet_ntop(AF_INET, &a, buf, sizeof(buf));
-	if (d->port)
-		printf(" %s %s:%u", opt, buf, ntohs(d->port));
-	else
-		printf(" %s %s", opt, buf);
+			"WGANYCAST: exactly one of --learn or --spray is required");
 }
 
 static void wganycast_print(const void *entry,
 			    const struct xt_entry_target *tgt, int numeric)
 {
 	const struct xt_wganycast_info *info = (const void *)tgt->data;
-	int i;
 
-	if (info->mode == XT_WGANYCAST_MODE_SPRAY) {
-		for (i = 0; i < info->ndests; i++)
-			print_dest(&info->dests[i], "--dest");
-	} else if (info->mode == XT_WGANYCAST_MODE_CANONICAL) {
-		print_dest(&info->dests[0], "--canonical");
-	}
+	if (info->mode == XT_WGANYCAST_MODE_LEARN)
+		printf(" --learn");
+	else if (info->mode == XT_WGANYCAST_MODE_SPRAY)
+		printf(" --spray");
 }
 
 static void wganycast_save(const void *entry,

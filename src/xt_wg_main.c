@@ -47,9 +47,13 @@ static int __init xt_wg_init(void)
 	if (rc)
 		return rc;
 
+	rc = xt_wganycast_module_init();
+	if (rc)
+		goto err_anycast_helper;
+
 	rc = xt_register_targets(xt_wganycast_targets, xt_wganycast_targets_n);
 	if (rc)
-		goto err_anycast;
+		goto err_anycast_target;
 
 	rc = xt_register_targets(xt_wgptcp_targets, xt_wgptcp_targets_n);
 	if (rc)
@@ -59,7 +63,9 @@ static int __init xt_wg_init(void)
 
 err_ptcp:
 	xt_unregister_targets(xt_wganycast_targets, xt_wganycast_targets_n);
-err_anycast:
+err_anycast_target:
+	xt_wganycast_module_exit();
+err_anycast_helper:
 	xt_unregister_targets(xt_wgobfs_targets, xt_wgobfs_targets_n);
 	return rc;
 }
@@ -68,6 +74,7 @@ static void __exit xt_wg_exit(void)
 {
 	xt_unregister_targets(xt_wgptcp_targets, xt_wgptcp_targets_n);
 	xt_unregister_targets(xt_wganycast_targets, xt_wganycast_targets_n);
+	xt_wganycast_module_exit();
 	xt_unregister_targets(xt_wgobfs_targets, xt_wgobfs_targets_n);
 }
 

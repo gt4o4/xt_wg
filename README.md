@@ -6,9 +6,15 @@ across hostile or asymmetric networks:
 - **`WGOBFS`** — chacha-keyed payload obfuscation. DPI can't fingerprint
   the WG message shape. Cross-platform clients can use
   [rs-wgobfs](https://github.com/infinet/rs-wgobfs).
-- **`WGANYCAST`** — stateless per-packet UDP destination spray plus
-  matching source canonicalisation. Lets a single WG flow ride two or
-  more anycast endpoints without conntrack/DNAT.
+- **`WGANYCAST`** — WG-protocol-aware dynamic anycast pool learning.
+  Allocates a per-session anchor conntrack on first observed RESP,
+  encoding `(Sa, our_idx)` in the ORIGINAL tuple and `(Sa, peer_idx)`
+  in REPLY.  LEARN registers permanent `nf_conntrack_expect` entries
+  under the anchor for each observed inbound source; SPRAY picks one
+  uniformly at random and rewrites outbound dst.  No static pool
+  enumeration at the rule level — pool entries are learned from
+  observed inbound WG traffic and self-reap via standard conntrack
+  GC at WG `REJECT_AFTER_TIME + 20 s`.
 - **`WGPTCP`** — UDP↔fake-TCP transmutation with stateful flow tracking
   via `ct->mark`. Reproduces a textbook Linux TCP handshake +
   ESTABLISHED data stream so middleboxes that block or rate-limit UDP
@@ -122,59 +128,102 @@ See [openwrt/package/README.md](/openwrt/package/README.md).
 
 ## WGANYCAST
 
-Stateless per-packet UDP destination/source rewriter. Fans a single
-UDP flow across multiple anycast endpoints without conntrack/DNAT.
-Written for spraying WG across two anycast IPs that DNAT to the same
-backend, but applies to any UDP service.
+WG-protocol-aware dynamic anycast pool learning + per-packet UDP
+destination spray.  Two modes, no rule-level arguments — the pool is
+built at runtime from observed inbound WG traffic.
 
 ### Modes
 
-- **`--dest IP[:PORT]`** (SPRAY) — for each outbound packet, picks one
-  destination uniformly at random and rewrites destination IP/port.
-  Use in `mangle` OUTPUT/POSTROUTING (priority -150, AFTER conntrack
-  at -200 — conntrack records the canonical dst, one stable entry
-  regardless of which pool member the spray picked). Up to 8
-  destinations per rule.
-- **`--canonical IP[:PORT]`** — rewrites an inbound packet's source
-  IP/port to a single canonical address. Use in `raw` PREROUTING
-  (priority -300, BEFORE conntrack at -200 — the inbound entry's
-  reply tuple matches the OUTPUT entry, giving one symmetric
-  conntrack entry per flow instead of two orphans). Makes replies
-  from any pool member look like one peer endpoint, so WG roaming
-  stays pinned.
+- **`--learn`** — install in `raw` PREROUTING (priority -300, BEFORE
+  conntrack at -200).  Parses the WG type byte and extracts session
+  indices (`sender_index` / `receiver_index`) from the WG payload.
+  On type=2 RESP, allocates a per-session anchor conntrack (synthetic
+  5-tuple encoding `(Sa, our_idx)` in ORIGINAL, `(Sa, peer_idx)` in
+  REPLY, `dst.port = 0` so the tuple never collides with a real flow).
+  On every observed inbound, registers or refreshes a permanent
+  `nf_conntrack_expect` under the anchor for the packet's
+  `(anycast_src, anycast_sport)`.  Pool is capped at 8 entries with
+  LRU eviction.
+- **`--spray`** — install in `raw` OUTPUT (priority -300, BEFORE
+  conntrack at -200).  Looks up the anchor by WG `receiver_index`
+  (= `peer_idx` for outbound DATA/COOKIE).  Iterates the anchor's
+  expectations, picks one uniformly at random, rewrites `iph->daddr`
+  + `udph->dest` with incremental checksum updates.  Empty pool →
+  `XT_CONTINUE` (packet goes to WG's configured `peer.endpoint`
+  as-is — handles cold-start handshakes).
 
-Mutually exclusive in a single rule. Typical deployment: one SPRAY
-on OUTPUT mangle plus one CANONICAL per pool member on raw PREROUTING.
+Mutually exclusive in a single rule.  Typical deployment: one LEARN
+rule plus one SPRAY rule per WG listenPort.
+
+### Anchor lifecycle
+
+| Object | Created | Reaped by |
+|---|---|---|
+| Anchor `nf_conn` | LEARN/SPRAY at first observed RESP | conntrack GC at 200 s (WG `REJECT_AFTER_TIME + 20 s`).  `IPS_FIXED_TIMEOUT_BIT` blocks refresh; `nf_ct_remove_expectations()` clears the pool automatically. |
+| Permanent expectation | LEARN on inbound observation | Anchor reap (bulk-removed via `nf_ct_remove_expectations`), or pool-capacity LRU evicts oldest via `nf_ct_unexpect_related`. |
+| Real child ct (anycast flow) | conntrack hook on each new inbound/outbound tuple, via expectation match | UDP unreplied 30 s / stream 120 s. |
+
+No module-private storage, no module-managed GC, no per-packet
+refresh dance.  A no-op `nf_conntrack_helper` (matching never-used
+UDP port 0) is registered to satisfy the kernel's helper-required
+check in `__nf_ct_expect_check` — it has no `.help()` work and never
+auto-attaches to real flows.
+
+### Multi-peer on one WG interface
+
+Anchors are keyed by WG `our_idx` (32-bit session index, unique per
+active session on a device).  Two peers sharing the same listenPort
+get distinct anchors; LEARN/SPRAY for one session never affects the
+other.  No per-peer rule configuration needed.
+
+### Re-key handling via WG's overlap window
+
+WG re-keys every ~120 s (`REKEY_AFTER_TIME`).  `REJECT_AFTER_TIME =
+180 s` gives a ~60 s window where both old and new session indices
+are live: the new anchor's pool refills from observed traffic before
+the old anchor expires at 200 s.  No special handling required.
 
 ### Example: WG over two Cloudflare Spectrum anycasts
 
-Gateway maps both anycast IPs' UDP/59263 → backend's WG :51821:
+Gateway maps both anycast IPs' UDP/59263 → backend's WG :51821.
+WG's `listenPort = 51821` on both ends.
 
 ```shell
-# Egress: spray each WG packet
-iptables -t mangle -A OUTPUT -p udp -d 193.134.211.67 --dport 51821 \
-  -j WGANYCAST --dest 161.248.136.186:59263 --dest 138.252.162.176:59263
+# Observe inbound, learn the anycast doors.  Self-installs the
+# per-session anchor + permanent expectations.
+iptables -t raw -A PREROUTING -p udp --dport 51821 -j WGANYCAST --learn
 
-# Ingress: canonicalise both replies back to the original peer
-iptables -t raw -A PREROUTING -p udp -s 161.248.136.186 --sport 59263 \
-  -j WGANYCAST --canonical 193.134.211.67:51821
-iptables -t raw -A PREROUTING -p udp -s 138.252.162.176 --sport 59263 \
-  -j WGANYCAST --canonical 193.134.211.67:51821
+# Spray outbound across the learned doors.  Cold-start handshake
+# (no anchor yet) falls through to WG's configured peer.endpoint.
+iptables -t raw -A OUTPUT     -p udp --sport 51821 -j WGANYCAST --spray
 ```
 
-If the gateway DNAT preserves port, omit `:59263` from all entries.
+That's the entire ruleset — both directions of the flow are handled
+by the conntrack hashtable.  Port-translation by the gateway (e.g.
+anycast:59263 → backend:51821 in CF Spectrum) is learned implicitly
+because the expectation captures the observed source `(ip, port)`.
 
 ### Notes
 
-- **Conflicts with conntrack-DNAT** for the same `(dest, port)` — the
-  first packet's NAT mapping pins all subsequent ones. Drop the
-  DNAT entry and flush stale conntrack
-  (`conntrack -D -p udp --dport <wg-port> --orig-dst <peer>`)
-  before adding WGANYCAST rules.
+- **Synthetic-tuple collision-free**: anchor tuples have
+  `dst.port = 0` (RFC-reserved, no real UDP flow uses it), so the
+  hashtable lookup by anchor tuple is guaranteed not to match real
+  packets.  Anchors appear in `/proc/net/nf_conntrack` with
+  `src=Sa.ip dst=<idx_as_ip> sport=Sa.port dport=0 [ASSURED]` — odd
+  shape but functionally inert.
+- **Anti-poisoning**: LEARN only processes packets passing WG type
+  byte + size validation.  Attacker would need to forge the
+  receiver-side `our_idx` (32-bit value chosen by WG kernel at
+  handshake) AND match an in-pool slot — bounded by the 8-entry LRU
+  cap, legitimate anycast IPs displace attackers on next genuine
+  inbound.
 - **`iptables -j DNAT --random` is not equivalent**: `-j DNAT` runs
   in `nat` and registers the mapping in conntrack, so every packet
-  of the same 5-tuple inherits the *first* random pick. WGANYCAST
-  is per-packet stateless.
+  of the same 5-tuple inherits the *first* random pick.  WGANYCAST
+  picks per-packet, with per-session pool isolation.
+- **Pre-v3 `--dest` / `--canonical` are gone**.  The static pool
+  enumeration and source-canonicalisation are replaced by dynamic
+  learning + the synthetic-tuple-anchor mechanism.
 
 
 ## WGPTCP
