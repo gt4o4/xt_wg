@@ -1,4 +1,7 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
+ * Author: Bingchen Gong <gongbingchen@gmail.com>
+ *
  * Shared declarations for the consolidated xt_wg.ko module.
  *
  * Each target translation unit (xt_WGOBFS_main.c, xt_WGANYCAST_main.c,

@@ -1,4 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Author: Bingchen Gong <gongbingchen@gmail.com>
+ *
  * iptables WGPTCP target plugin
  */
 #include <stdio.h>

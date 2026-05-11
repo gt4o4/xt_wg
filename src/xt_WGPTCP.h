@@ -1,7 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
+ * Author: Bingchen Gong <gongbingchen@gmail.com>
+ *
  * xt_WGPTCP — shared header (kernel + userspace)
  *
- * Stateless UDP↔fake-TCP transmutation for WireGuard-over-DPI.
+ * UDP↔fake-TCP transmutation for WireGuard-over-DPI. Per-flow state
+ * lives in ct->mark of the underlying UDP conntrack entry.
  *
  *   ENCODE — rewrite outbound UDP packet to a TCP SYN that carries the
  *            UDP payload as TCP data, with a TFO cookie option (RFC 7413)

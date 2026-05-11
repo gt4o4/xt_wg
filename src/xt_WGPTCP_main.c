@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * xt_WGPTCP — stateless UDP↔fake-TCP transmutation, WG-protocol-aware.
+ * Author: Bingchen Gong <gongbingchen@gmail.com>
+ *
+ * xt_WGPTCP — UDP↔fake-TCP transmutation with stateful flow tracking
+ * via ct->mark of the underlying UDP conntrack entry.
  *
  * Maps each WireGuard message type onto a different TCP shape so that the
  * wire-level packets reproduce a real TCP 3-way handshake + ESTABLISHED

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Author: Bingchen Gong <gongbingchen@gmail.com>
+ *
  * xt_wg.ko — consolidated entry point for the WireGuard helper xtables
  * targets:
  *

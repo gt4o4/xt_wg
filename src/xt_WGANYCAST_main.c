@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Author: Bingchen Gong <gongbingchen@gmail.com>
+ *
  * xt_WGANYCAST kernel module — see xt_WGANYCAST.h for protocol semantics.
  *
  * Use:
