@@ -23,11 +23,25 @@
 
 #include <linux/module.h>
 #include <linux/netfilter/x_tables.h>
+#include <net/netfilter/nf_conntrack_acct.h>
 #include "xt_wg_common.h"
 
 static int __init xt_wg_init(void)
 {
 	int rc;
+
+	/* WGPTCP v2.2 reads per-flow byte counters from nf_conn_acct.
+	 * Force-enable the per-netns sysctl so newly-created conntracks
+	 * get the acct extension allocated.  Sysctl is also asserted in
+	 * the NixOS module (boot.kernel.sysctl), so this is belt-and-
+	 * suspenders.  Pre-existing conntracks without the extension
+	 * cause the encoder to return XT_CONTINUE (logged warn-rate-
+	 * limited); they age out within UDP-unreplied timeout (30 s).
+	 */
+	if (!nf_ct_acct_enabled(&init_net)) {
+		pr_warn("xt_wg: nf_conntrack_acct was disabled; enabling for WGPTCP\n");
+		nf_ct_set_acct(&init_net, true);
+	}
 
 	rc = xt_register_targets(xt_wgobfs_targets, xt_wgobfs_targets_n);
 	if (rc)

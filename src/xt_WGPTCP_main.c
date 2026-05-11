@@ -3,7 +3,8 @@
  * Author: Bingchen Gong <gongbingchen@gmail.com>
  *
  * xt_WGPTCP — UDP↔fake-TCP transmutation with stateful flow tracking
- * via ct->mark of the underlying UDP conntrack entry.
+ * via conntrack accounting (nf_conn_acct) on the underlying UDP
+ * conntrack entry.  No module-side writes to ct fields.
  *
  * Maps each WireGuard message type onto a different TCP shape so that the
  * wire-level packets reproduce a real TCP 3-way handshake + ESTABLISHED
@@ -48,6 +49,7 @@
 #include <net/tcp.h>
 #include <net/udp.h>
 #include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_acct.h>
 #include "xt_WGPTCP.h"
 #include "wg.h"
 #include "xt_wg_common.h"
@@ -120,28 +122,43 @@ struct wg_message_transport_min {
 #define ROLE_OUT	"out "	/* outbound seq base */
 #define ROLE_ACK	"ack "	/* outbound ack_seq base (= peer's seq base + 149) */
 
-#define WGPTCP_INIT_TFO_DATA_LEN	148u	/* size of WG type=1 INIT */
-#define WGPTCP_RESP_TFO_DATA_LEN	92u	/* size of WG type=2 RESP */
+/* Reference WG message sizes — not used by the encoder math directly
+ * in v2.2 (counters come from acct), kept as documentation of the
+ * expected wire sizes for the WG-type validation switch. */
+#define WGPTCP_INIT_TFO_DATA_LEN	148u	/* WG type=1 INIT */
+#define WGPTCP_RESP_TFO_DATA_LEN	92u	/* WG type=2 RESP */
 
-/* `ct->mark` stores OUTBOUND cumulative byte count for this flow:
- *   0 = no outbound packet emitted yet on this conntrack entry.
- *       Next encode emits SYN (initiator) or SYN+ACK (responder).
- *   N = N total bytes of outbound payload have been emitted, summed
- *       across SYN/SYN+ACK + every subsequent PSH+ACK.  TCP seq for
- *       the next outbound = H(K, saddr, "out") + 1 + N.
- *
- * Lifetime bound to the conntrack entry — when WG goes silent past the
- * UDP-conntrack timeout, the entry ages out, mark vanishes with it,
- * and the next outbound packet starts fresh with a SYN.  Re-handshakes
- * inside the conntrack lifetime just add their payload to mark.
+/* Per-packet L3 overhead subtracted from acct->counter[].bytes to recover
+ * UDP-payload-only cumulative bytes (= what our seq math uses).  IPv4
+ * (20) + UDP (8) = 28 B.  Assumes no IP options (not used by WG / our
+ * flows); if IP options ever appear, the subtraction underestimates
+ * slightly but stays well within the TCP receive window.
  */
+#define WGPTCP_L3_OVERHEAD		28u
 
-/* The peer's first-packet byte count is derived from `ctinfo` direction:
- * if outbound is the REPLY direction of the conntrack tuple, peer is the
- * initiator and sent INIT (148 B); otherwise peer is the responder and
- * sent RESP (92 B).  Cookie scenario gives 28 B residual fudge (peer
- * first packet = 64 B vs 92 B fallback) — within any sane TCP window.
- * No per-flow side-table is needed.
+/* Per-flow state (v2.2):
+ *
+ * We don't claim any conntrack field for our own writes.  All per-flow
+ * byte counts come from kernel-managed conntrack accounting
+ * (`nf_conn_acct`, enabled per-netns via sysctl
+ * net.netfilter.nf_conntrack_acct=1, force-enabled at module init).
+ *
+ *   own_cum  = counter[own_dir].bytes  - counter[own_dir].packets  * 28
+ *   peer_cum = counter[peer_dir].bytes - counter[peer_dir].packets * 28
+ *
+ *   own_dir  = (ctinfo == IP_CT_ESTABLISHED_REPLY) ? REPLY : ORIGINAL
+ *   peer_dir = !own_dir
+ *
+ * Conntrack at LOCAL_OUT/-200 has already updated counter[own_dir] by
+ * the time the encoder runs at OUTPUT mangle/-150, so own_packets
+ * includes the current outbound.  First-outbound detection is
+ * `own_packets == 1`, which works on BOTH initiator and responder
+ * (ctinfo alone is ambiguous on the responder side — always
+ * IP_CT_ESTABLISHED_REPLY, on first and subsequent alike).
+ *
+ * Net effect on ct fields: we don't write to ct->mark or ct->labels.
+ * Hosts can freely use connmark for `-j CONNMARK` / fwmark routing.
+ * The only kernel-side claim is the acct sysctl (per-netns boolean).
  */
 
 /* Default key for unkeyed mode — used so derived values are deterministic
@@ -349,46 +366,56 @@ static unsigned int wgptcp_encode_common(struct sk_buff *skb,
 }
 
 /* --------------------------------------------------------------------
- *   ENCODE — flow-state-driven via ct->mark + ctinfo (v2.1)
+ *   ENCODE — flow-state-driven via conntrack accounting (v2.2)
  *
- * ct->mark holds own_cum_bytes_total (= own_init + sum of all
- * post-init payload_lens).  Wire-shape selection:
+ * Reads own/peer cumulative-byte counters from `nf_conn_acct` (the
+ * kernel's built-in conntrack accounting extension; enabled per-netns
+ * via sysctl net.netfilter.nf_conntrack_acct=1, force-enabled in our
+ * module init).  No module-side writes to any conntrack field — the
+ * conntrack hook (priority -200) auto-increments counters before this
+ * encoder runs (priority -150).
  *
- *   own_cum == 0 + ctinfo == IP_CT_NEW              → SYN
- *   own_cum == 0 + ctinfo == IP_CT_ESTABLISHED_REPLY → SYN+ACK
- *   own_cum >  0 + WG INIT + !SEEN_REPLY             → SYN (stuck-flow recovery)
- *   own_cum >  0                                    → PSH+ACK
+ * Wire-shape selection:
+ *
+ *   own_packets == 1 + ctinfo == IP_CT_NEW              → SYN
+ *   own_packets == 1 + ctinfo == IP_CT_ESTABLISHED_REPLY → SYN+ACK
+ *   own_packets >  1 + WG INIT + !SEEN_REPLY             → SYN (stuck-flow recovery)
+ *   own_packets >  1                                    → PSH+ACK
  *
  * Math (uniform across shapes):
- *   seq     = H(K, saddr, "out") + 1 + own_cum
- *   ack_seq = H(K, daddr, "out") + 1 + peer_eff
  *
- * peer_eff is ctinfo-direction-derived: peer's first packet is INIT=148
- * if outbound is the REPLY direction of the conntrack tuple (i.e., peer
- * initiated, we're responding), else RESP=92 (we initiated, peer is
- * responding).  Cookie scenario residually fudges to 28 B (peer first
- * packet = COOKIE=64 vs fallback 92), within any sane TCP window.
+ *   seq     = H(K, saddr, "out") + 1 + own_cum_before
+ *   ack_seq = H(K, daddr, "out") + 1 + peer_cum
  *
- * Working flows ride PSH+ACK with byte-accurate cumulative seq across
- * WG re-handshakes — no SYN→ESTABLISHED transition for the in-path
- * middlebox to dislike (the v2 fix for the Cloudflare-Spectrum 180 s
- * cliff).  ack_seq is stationary (= peer_eff + 1) — looks like a
- * perpetual duplicate-ACK; loose-mode middleboxes accept.  Strict
- * middleboxes that demand monotonic ack progression would dislike this
- * — deferred mitigation is a postct hook stashing peer cum_bytes in
- * ct->labels, not implemented since no strict middlebox has been
- * observed in the fleet.
+ *   own_cum_before = (own_bytes - own_packets * 28) - current_payload_len
+ *   peer_cum       = peer_bytes - peer_packets * 28
  *
- * Stuck-flow recovery: if own_cum > 0 but no reply has ever arrived
+ * Both seq and ack_seq are byte-accurate — peer_cum advances each
+ * time conntrack accounts an inbound, so the running ack_seq satisfies
+ * strict middleboxes that demand monotonic ack progression.  Working
+ * flows ride PSH+ACK with byte-accurate cumulative seq across WG
+ * re-handshakes — no SYN→ESTABLISHED transition for the in-path
+ * middlebox to dislike (v2 fix for the Cloudflare-Spectrum 180 s cliff).
+ *
+ * Stuck-flow recovery: if own_packets > 1 but no reply has ever arrived
  * (`!(ct->status & IPS_SEEN_REPLY)`), the middlebox on the return path
  * probably never opened flow state.  Re-fire SYN on every WG type=1
  * INIT — cadence driven by WG itself (REKEY_TIMEOUT = 5 s, capped at
- * REKEY_ATTEMPT_TIME = 90 s).  ct->mark left intact during refire so
- * own_cum stays valid for when the path unblocks.  Asymmetric by design:
- * the condition only fires on the originator side (where reply direction
- * = inbound, IPS_SEEN_REPLY tracks "peer reached us").  On the responder,
- * IPS_SEEN_REPLY flips on first outbound — once the originator recovers,
- * the responder's existing PSH+ACK retransmits land on their own.
+ * REKEY_ATTEMPT_TIME = 90 s).  Conntrack accounting keeps advancing
+ * regardless, so own_cum stays valid for when the path unblocks.
+ * Asymmetric by design: the condition only fires on the originator
+ * side (where reply direction = inbound, IPS_SEEN_REPLY tracks "peer
+ * reached us").  On the responder, IPS_SEEN_REPLY flips on first
+ * outbound — once the originator recovers, the responder's existing
+ * PSH+ACK retransmits land on their own.
+ *
+ * Accounting-disabled fallback: if `nf_conn_acct_find(ct)` returns NULL
+ * (acct extension not allocated — pre-acct conntrack or sysctl off),
+ * the encoder returns XT_CONTINUE.  The UDP packet escapes unencoded;
+ * the WG tunnel breaks visibly on that flow, logged via
+ * pr_warn_ratelimited.  Module init enables the sysctl, so this path
+ * only triggers for pre-existing conntracks; they age out within
+ * minutes (UDP unreplied timeout = 30 s).
  * -------------------------------------------------------------------- */
 static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 				     const struct xt_wgptcp_info *info)
@@ -402,8 +429,11 @@ static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 	u8	 flags;
 	unsigned int tcp_hdr_len;
 	struct nf_conn *ct;
+	struct nf_conn_acct *acct;
 	enum ip_conntrack_info ctinfo;
-	u32	 syn_seq_base, ack_seq_base, own_cum, peer_eff;
+	enum ip_conntrack_dir  own_dir, peer_dir;
+	u64	 own_bytes, own_packets, peer_bytes, peer_packets;
+	u32	 syn_seq_base, ack_seq_base, own_cum_incl, own_cum_before, peer_cum;
 
 	iph = ip_hdr(skb);
 	if (iph->protocol != IPPROTO_UDP)
@@ -459,64 +489,80 @@ static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 	syn_seq_base = wgptcp_derive(info, iph->saddr, ROLE_OUT);
 	ack_seq_base = wgptcp_derive(info, iph->daddr, ROLE_OUT);
 
-	ct      = nf_ct_get(skb, &ctinfo);
-	own_cum = ct ? READ_ONCE(ct->mark) : 0;
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct)
+		return XT_CONTINUE;	/* no conntrack — can't compute cum */
 
-	/* peer_eff: ctinfo-direction-derived peer first-packet size.
-	 * Peer is initiator (sent INIT=148 B) when outbound is on the
-	 * REPLY tuple direction; otherwise peer is responder (sent
-	 * RESP=92 B).  Cookie gives 28 B residual fudge (peer_init=64
-	 * vs fallback 92), within window. */
-	peer_eff = (ctinfo == IP_CT_ESTABLISHED_REPLY
-			? WGPTCP_INIT_TFO_DATA_LEN
-			: WGPTCP_RESP_TFO_DATA_LEN);
+	acct = nf_conn_acct_find(ct);
+	if (!acct) {
+		/* Conntrack accounting extension not allocated for this entry.
+		 * Most likely a pre-acct conntrack (created before sysctl
+		 * `net.netfilter.nf_conntrack_acct=1` took effect).  Escape
+		 * unencoded — UDP goes on the wire as UDP.  Pre-existing
+		 * entries age out within the UDP-unreplied timeout (30 s) and
+		 * are re-created with acct attached. */
+		pr_warn_ratelimited("xt_WGPTCP: no acct extension on conntrack — UDP escapes unencoded; ensure net.netfilter.nf_conntrack_acct=1\n");
+		return XT_CONTINUE;
+	}
+
+	own_dir  = (ctinfo == IP_CT_ESTABLISHED_REPLY) ? IP_CT_DIR_REPLY
+						       : IP_CT_DIR_ORIGINAL;
+	peer_dir = (own_dir == IP_CT_DIR_REPLY) ? IP_CT_DIR_ORIGINAL
+						: IP_CT_DIR_REPLY;
+
+	own_bytes    = atomic64_read(&acct->counter[own_dir].bytes);
+	own_packets  = atomic64_read(&acct->counter[own_dir].packets);
+	peer_bytes   = atomic64_read(&acct->counter[peer_dir].bytes);
+	peer_packets = atomic64_read(&acct->counter[peer_dir].packets);
+
+	/* Strip per-packet IP+UDP overhead to recover UDP-payload-only
+	 * cumulatives.  `own_cum_incl` includes the current outbound
+	 * (conntrack hook ran before us and already counted it);
+	 * `own_cum_before` excludes it for the seq math. */
+	own_cum_incl   = (u32)(own_bytes  - own_packets  * WGPTCP_L3_OVERHEAD);
+	own_cum_before = own_cum_incl - payload_len;
+	peer_cum       = (u32)(peer_bytes - peer_packets * WGPTCP_L3_OVERHEAD);
 
 	/* Stuck-flow recovery: originator sent at least one SYN/SYN+ACK
-	 * (own_cum > 0) but conntrack has never seen a packet in the reply
-	 * direction (IPS_SEEN_REPLY not set).  Middlebox on return path
-	 * likely dropped our handshake — re-fire SYN on every WG INIT
+	 * (own_packets > 1) but conntrack has never seen a packet in the
+	 * reply direction (IPS_SEEN_REPLY not set).  Middlebox on return
+	 * path likely dropped our handshake — re-fire SYN on every WG INIT
 	 * until either the middlebox opens flow state or WG itself gives
 	 * up at REKEY_ATTEMPT_TIME (90 s).  See block comment above.
 	 */
-	if (own_cum > 0 && wg_type == WG_TYPE_INIT && ct &&
+	if (own_packets > 1 && wg_type == WG_TYPE_INIT &&
 	    !(READ_ONCE(ct->status) & IPS_SEEN_REPLY)) {
 		flags       = TCPHDR_SYN;
 		seq         = (__force __be32)cpu_to_be32(syn_seq_base);
 		ack_seq     = 0;
 		tcp_hdr_len = WGPTCP_TCP_HDR_HS;
-		/* Leave ct->mark unchanged so own_cum stays valid for the
-		 * post-recovery PSH+ACK stream. */
-	} else if (own_cum == 0) {
+	} else if (own_packets == 1) {
 		/* First outbound packet on this conntrack entry. */
-		if (!ct || ctinfo == IP_CT_NEW) {
-			/* We initiated this flow — emit a SYN with TFO data. */
-			flags   = TCPHDR_SYN;
-			ack_seq = 0;
-		} else {
+		if (ctinfo == IP_CT_ESTABLISHED_REPLY) {
 			/* Peer initiated — emit SYN+ACK with TFO data, acking
-			 * the peer's prior INIT (peer_eff = 148 B via the
-			 * ctinfo=REPLY fallback). */
+			 * peer's INIT (peer_cum = peer's first-packet size,
+			 * 148 B in the normal case, 64 B if cookie). */
 			flags   = TCPHDR_SYN | TCPHDR_ACK;
 			ack_seq = (__force __be32)cpu_to_be32(
-				ack_seq_base + 1 + peer_eff);
+				ack_seq_base + 1 + peer_cum);
+		} else {
+			/* We initiated — emit SYN with TFO data. */
+			flags   = TCPHDR_SYN;
+			ack_seq = 0;
 		}
 		seq         = (__force __be32)cpu_to_be32(syn_seq_base);
 		tcp_hdr_len = WGPTCP_TCP_HDR_HS;
-		if (ct)
-			WRITE_ONCE(ct->mark, payload_len);    /* own_init */
 	} else {
-		/* ESTABLISHED — PSH+ACK with byte-accurate cumulative seq.
-		 * ack_seq is stationary at (peer_eff + 1) — looks like a
-		 * perpetual duplicate-ACK; loose-mode middleboxes accept.
-		 * peer_eff was derived from ctinfo direction above (148 on
-		 * responder side, 92 on initiator side). */
+		/* ESTABLISHED — PSH+ACK with byte-accurate seq AND ack_seq.
+		 * ack_seq tracks peer's cumulative bytes (peer_cum) so strict
+		 * middleboxes that demand monotonic ack progression see
+		 * exactly that.  Loose-mode middleboxes accept either way. */
 		flags       = TCPHDR_PSH | TCPHDR_ACK;
 		seq         = (__force __be32)cpu_to_be32(
-				syn_seq_base + 1 + own_cum);
+				syn_seq_base + 1 + own_cum_before);
 		ack_seq     = (__force __be32)cpu_to_be32(
-				ack_seq_base + 1 + peer_eff);
+				ack_seq_base + 1 + peer_cum);
 		tcp_hdr_len = WGPTCP_TCP_HDR_DATA;
-		WRITE_ONCE(ct->mark, own_cum + payload_len);
 	}
 
 	/* Optional WGOBFS-style payload mangling — applied while skb is
