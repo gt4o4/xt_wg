@@ -275,7 +275,7 @@ static unsigned int wgptcp_encode_common(struct sk_buff *skb,
 	 */
 	opts = (u8 *)tcph + sizeof(struct tcphdr);
 	if (tcp_hdr_len == WGPTCP_TCP_HDR_HS) {
-		u32 ts_val = tcp_time_stamp_raw();
+		u32 ts_val = jiffies_to_msecs(jiffies);
 		__be32 cookie_v;
 
 		/* MSS (4 B): kind=2 len=4 value=1460 */
@@ -314,7 +314,7 @@ static unsigned int wgptcp_encode_common(struct sk_buff *skb,
 		memcpy(opts + 24, &cookie_v, 4);
 	} else {
 		/* PSH+ACK: NOP NOP + TS only (12 B) */
-		u32 ts_val = tcp_time_stamp_raw();
+		u32 ts_val = jiffies_to_msecs(jiffies);
 
 		opts[0] = WGPTCP_TCPOPT_NOP;
 		opts[1] = WGPTCP_TCPOPT_NOP;
