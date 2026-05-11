@@ -180,19 +180,23 @@ If the gateway DNAT preserves port, omit `:59263` from all entries.
 ## WGPTCP
 
 WG-aware UDP↔fake-TCP transmutation. Per-flow state lives in
-`ct->mark` of the underlying UDP conntrack entry —
-`nf_ct_is_confirmed(ct)` + `ct->mark` together drive shape selection
-without any module-local table.
+`ct->mark` (own cum_bytes) of the underlying UDP conntrack entry —
+shape selection AND byte-accurate own seq without any module-local
+table. Peer ack_seq is stationary, derived from `ctinfo` direction
+(no peer-side state needed).
 
 Wire-shape decision is **conntrack-state-driven** (not
 WG-type-driven):
 
 | State                                              | Shape     | Options                                              | Growth |
 |----------------------------------------------------|-----------|------------------------------------------------------|-------:|
-| `ct->mark == 0` + `IP_CT_NEW`                      | `SYN`     | MSS + SACK_Perm + TS + WSCALE=7 + TFO_Cookie (28 B)  | +40 B  |
-| `ct->mark == 0` + `IP_CT_ESTABLISHED_REPLY`        | `SYN+ACK` | same                                                 | +40 B  |
-| `ct->mark >= 1` + WG INIT + `!SEEN_REPLY`          | `SYN`     | same (stuck-flow recovery)                           | +40 B  |
-| `ct->mark >= 1`                                    | `PSH+ACK` | TS only (12 B)                                       | +24 B  |
+| `own_cum == 0` + `IP_CT_NEW`                       | `SYN`     | MSS + SACK_Perm + TS + WSCALE=7 + TFO_Cookie (28 B)  | +40 B  |
+| `own_cum == 0` + `IP_CT_ESTABLISHED_REPLY`         | `SYN+ACK` | same                                                 | +40 B  |
+| `own_cum >  0` + WG INIT + `!SEEN_REPLY`           | `SYN`     | same (stuck-flow recovery)                           | +40 B  |
+| `own_cum >  0`                                     | `PSH+ACK` | TS only (12 B)                                       | +24 B  |
+
+`own_cum = ct->mark` (byte-accurate own seq) and `peer_eff =
+ctinfo == REPLY ? 148 : 92` (stationary peer ack_seq, ctinfo-derived).
 
 The TCP option set on `SYN`/`SYN+ACK` matches what stock Linux's
 `tcp_select_initial_window` emits, so the initial fingerprint passes
@@ -224,24 +228,36 @@ POV), so the same signal isn't usable there. Fine in practice — once
 the originator's recovery SYN gets through, the responder's existing
 PSH+ACK retransmits land naturally.
 
+**Initial-value-accurate ack_seq (v2.1):** the encoder derives peer's
+first-packet size from `ctinfo` direction — peer sent INIT=148 when
+outbound is on the REPLY tuple (peer initiated, we're responding) or
+RESP=92 otherwise. This fixes the 56 B fudge v2.0 had (always +148
+even when peer was the responder). Cookie scenario gives a 28 B
+residual fudge (peer first packet = COOKIE=64 B vs fallback 92 B),
+within any sane TCP window. `ack_seq` remains stationary (perpetual
+duplicate-ACK pattern) — loose-mode middleboxes accept; strict
+middleboxes that demand monotonic ack progression would need the
+deferred `ct->labels`-based postct-hook mitigation (not implemented;
+no strict middlebox observed in the fleet).
+
 ### Sequence derivation
 
 `tcph->seq` and `tcph->ack_seq` are derived from `iph->{saddr,daddr}`
 via SipHash-2-4 with `--key`, plus the cumulative byte counter in
-`ct->mark`:
+`ct->mark` (own_cum):
 
 ```
 SYN.seq         = H(K, saddr, "out ")
 SYN+ACK.seq     = H(K, saddr, "out ")
-SYN+ACK.ack_seq = H(K, daddr, "ack ")
-PSH+ACK.seq     = H(K, saddr, "out ") + 1 + 148 + ct->mark
-PSH+ACK.ack_seq = H(K, daddr, "ack ")
+SYN+ACK.ack_seq = H(K, daddr, "out ") + 1 + peer_eff
+PSH+ACK.seq     = H(K, saddr, "out ") + 1 + ct->mark           (own_cum)
+PSH+ACK.ack_seq = H(K, daddr, "out ") + 1 + peer_eff
 ```
 
-After each PSH+ACK, the encoder writes back `ct->mark += payload_len`,
-so subsequent packets carry monotonically advancing seq. The stationary
-`ack_seq` looks like a perpetual "duplicate ACK" to loose conntrack
-trackers, which accept it.
+`peer_eff = ctinfo == IP_CT_ESTABLISHED_REPLY ? 148 : 92` —
+ctinfo-direction-derived peer first-packet size.  After each
+outbound, the encoder writes back `ct->mark += payload_len`
+(byte-accurate own seq).
 
 ### TFO cookie marker
 
@@ -307,10 +323,10 @@ With `--obfs`: random padding adds 0..32 B; budget another -32 in MTU.
 
 ### State storage caveat
 
-WGPTCP claims the full 32-bit `ct->mark` field for per-flow state. The
-host must not use connmark for anything else (`-j CONNMARK`, `-m
-mark`, fwmark-based routing) — those would collide. Switch to
-`ct->labels` if connmark coexistence is ever required.
+WGPTCP claims the full 32-bit `ct->mark` field for own_cum_bytes. The
+host must not use connmark for anything else (`-j CONNMARK`, `-m mark`,
+fwmark-based routing) — those would collide. Switch to `ct->labels` if
+connmark coexistence is ever required.
 
 ### Probe resistance
 
