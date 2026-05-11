@@ -187,22 +187,42 @@ without any module-local table.
 Wire-shape decision is **conntrack-state-driven** (not
 WG-type-driven):
 
-| State                                       | Shape     | Options                                              | Growth |
-|---------------------------------------------|-----------|------------------------------------------------------|-------:|
-| `ct->mark == 0` + `IP_CT_NEW`               | `SYN`     | MSS + SACK_Perm + TS + WSCALE=7 + TFO_Cookie (28 B)  | +40 B  |
-| `ct->mark == 0` + `IP_CT_ESTABLISHED_REPLY` | `SYN+ACK` | same                                                 | +40 B  |
-| `ct->mark >= 1`                             | `PSH+ACK` | TS only (12 B)                                       | +24 B  |
+| State                                              | Shape     | Options                                              | Growth |
+|----------------------------------------------------|-----------|------------------------------------------------------|-------:|
+| `ct->mark == 0` + `IP_CT_NEW`                      | `SYN`     | MSS + SACK_Perm + TS + WSCALE=7 + TFO_Cookie (28 B)  | +40 B  |
+| `ct->mark == 0` + `IP_CT_ESTABLISHED_REPLY`        | `SYN+ACK` | same                                                 | +40 B  |
+| `ct->mark >= 1` + WG INIT + `!SEEN_REPLY`          | `SYN`     | same (stuck-flow recovery)                           | +40 B  |
+| `ct->mark >= 1`                                    | `PSH+ACK` | TS only (12 B)                                       | +24 B  |
 
 The TCP option set on `SYN`/`SYN+ACK` matches what stock Linux's
 `tcp_select_initial_window` emits, so the initial fingerprint passes
 `p0f`-style classifiers as "Linux".
 
-Re-handshakes (WG `REJECT_AFTER_TIME = 180 s`, re-key every 120 s)
-ride as PSH+ACK with cumulative seq on the SAME conntrack entry — the
-middlebox sees one uninterrupted ESTABLISHED stream and never observes
-a SYN→ESTABLISHED transition. This is the v2 fix for the v1.5 failure
-mode (Cloudflare-Spectrum-style strict middleboxes dropping the
-re-handshake's fresh SYN as out-of-window).
+Re-handshakes on a working flow (WG `REJECT_AFTER_TIME = 180 s`,
+re-key every 120 s) ride as PSH+ACK with cumulative seq on the SAME
+conntrack entry — the middlebox sees one uninterrupted ESTABLISHED
+stream and never observes a SYN→ESTABLISHED transition. This is the
+v2 fix for the v1.5 failure mode (Cloudflare-Spectrum-style strict
+middleboxes dropping the re-handshake's fresh SYN as out-of-window).
+
+**Stuck-flow recovery:** if `ct->mark > 0` but `IPS_SEEN_REPLY` is
+still unset — i.e., we've sent at least one SYN/SYN+ACK but no return
+packet has ever come back — the middlebox on the return path
+probably dropped our handshake without opening flow state. The
+encoder re-fires a fresh SYN on every WG type=1 INIT. WG itself
+drives the cadence (`REKEY_TIMEOUT = 5 s`, capped at
+`REKEY_ATTEMPT_TIME = 90 s`), so worst case is ~18 SYN retransmits
+before WG gives up. Once any reply lands and `IPS_SEEN_REPLY` flips,
+the encoder drops back to PSH+ACK. `ct->mark` stays intact during
+refire so cum_bytes accounting is correct for the post-recovery
+stream.
+
+The recovery condition fires only on the **originator** side. On the
+responder, `IPS_SEEN_REPLY` flips to true the moment the first
+outbound is emitted (outbound IS the reply direction from conntrack's
+POV), so the same signal isn't usable there. Fine in practice — once
+the originator's recovery SYN gets through, the responder's existing
+PSH+ACK retransmits land naturally.
 
 ### Sequence derivation
 

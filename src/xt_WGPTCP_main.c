@@ -345,19 +345,37 @@ static unsigned int wgptcp_encode_common(struct sk_buff *skb,
 /* --------------------------------------------------------------------
  *   ENCODE — flow-state-driven via ct->mark + ctinfo (v2)
  *
- * The WG message-type byte is parsed only for size validation
- * (defensive: don't TCP-wrap arbitrary non-WG UDP).  Wire-shape
- * selection (SYN / SYN+ACK / PSH+ACK) comes from the conntrack
- * state, not from the WG type:
+ * The WG message-type byte is parsed for size validation (defensive:
+ * don't TCP-wrap arbitrary non-WG UDP) and for the stuck-flow recovery
+ * gate below.  Wire-shape selection (SYN / SYN+ACK / PSH+ACK) is
+ * conntrack-state-driven:
  *
  *   mark == 0 + ctinfo == IP_CT_NEW             → SYN
  *   mark == 0 + ctinfo == IP_CT_ESTABLISHED_REPLY → SYN+ACK
+ *   mark >= 1 + WG INIT + !SEEN_REPLY            → SYN (stuck recovery)
  *   mark >= 1                                    → PSH+ACK
  *
- * This makes re-handshakes (further type=1 INITs on the same
- * conntrack entry) ride as PSH+ACK with cumulative seq — the in-path
- * middlebox sees an uninterrupted ESTABLISHED stream and never
- * sees a SYN→ESTABLISHED transition to dislike.
+ * Working flows ride PSH+ACK with cumulative seq across WG re-handshakes
+ * (no SYN→ESTABLISHED transition for the in-path middlebox to dislike —
+ * the v2 fix for the Cloudflare-Spectrum 180 s cliff).
+ *
+ * Stuck-flow recovery: if mark > 0 but no reply has ever arrived back
+ * (`!(ct->status & IPS_SEEN_REPLY)`), the middlebox on the return
+ * path probably never opened flow state for our handshake.  Re-emit a
+ * fresh SYN on every WG type=1 INIT — WG itself drives the cadence
+ * (REKEY_TIMEOUT = 5 s for up to REKEY_ATTEMPT_TIME = 90 s, so
+ * ~18 SYN retransmits worst case).  Once a SYN registers and any
+ * reply lands, `IPS_SEEN_REPLY` flips and we drop back to PSH+ACK.
+ * ct->mark is left intact across refires so cum_bytes stays valid
+ * for when the path unblocks.
+ *
+ * The recovery condition only fires on the *originator* side
+ * (where reply direction = inbound, IPS_SEEN_REPLY tracks "did the
+ * peer reach us back").  On the responder side, IPS_SEEN_REPLY flips
+ * to true the moment we send our first outbound SYN+ACK (because
+ * outbound IS the reply direction from conntrack's POV), so the
+ * condition is asymmetric by design — once the originator recovers,
+ * the responder's existing PSH+ACK retransmits land on their own.
  * -------------------------------------------------------------------- */
 static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 				     const struct xt_wgptcp_info *info)
@@ -431,7 +449,22 @@ static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 	ct = nf_ct_get(skb, &ctinfo);
 	mark = ct ? READ_ONCE(ct->mark) : 0;
 
-	if (mark == 0) {
+	/* Stuck-flow recovery: originator sent at least one SYN/SYN+ACK
+	 * (mark > 0) but conntrack has never seen a packet in the reply
+	 * direction (IPS_SEEN_REPLY not set).  Middlebox on return path
+	 * likely dropped our handshake — re-fire SYN on every WG INIT
+	 * until either the middlebox opens flow state or WG itself gives
+	 * up at REKEY_ATTEMPT_TIME (90 s).  See block comment above.
+	 */
+	if (mark > 0 && wg_type == WG_TYPE_INIT && ct &&
+	    !(READ_ONCE(ct->status) & IPS_SEEN_REPLY)) {
+		flags       = TCPHDR_SYN;
+		seq         = (__force __be32)cpu_to_be32(syn_seq_base);
+		ack_seq     = 0;
+		tcp_hdr_len = WGPTCP_TCP_HDR_HS;
+		/* Leave ct->mark unchanged so cum_bytes stays valid for the
+		 * post-recovery PSH+ACK stream. */
+	} else if (mark == 0) {
 		/* First outbound packet on this conntrack entry. */
 		if (!ct || ctinfo == IP_CT_NEW) {
 			/* We initiated this flow — emit a SYN with TFO data. */
@@ -450,9 +483,10 @@ static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 			WRITE_ONCE(ct->mark, WGPTCP_MARK_INITIAL_SENTINEL);
 	} else {
 		/* ESTABLISHED — every subsequent outbound packet (including
-		 * WG re-handshakes) rides as PSH+ACK with cumulative seq.
-		 * Stationary ack_seq (= peer's SYN seq + 149) — looks like a
-		 * "duplicate ACK" pattern; loose-mode middleboxes accept.
+		 * WG re-handshakes on a working flow) rides as PSH+ACK with
+		 * cumulative seq.  Stationary ack_seq (= peer's SYN seq + 149)
+		 * — looks like a "duplicate ACK" pattern; loose-mode middleboxes
+		 * accept.
 		 */
 		u32 cum_bytes = mark - WGPTCP_MARK_INITIAL_SENTINEL;
 
@@ -465,10 +499,6 @@ static unsigned int wgptcp_encode_v4(struct sk_buff *skb,
 		tcp_hdr_len = WGPTCP_TCP_HDR_DATA;
 		WRITE_ONCE(ct->mark, mark + payload_len);
 	}
-
-	/* Suppress unused-var warning if wg_type ends up unused after the
-	 * size-validation switch (no per-type seq derivation in v2). */
-	(void)wg_type;
 
 	/* Optional WGOBFS-style payload mangling — applied while skb is
 	 * still UDP-shaped, so wg_obfs_payload's `udp_hdr(skb)` access
