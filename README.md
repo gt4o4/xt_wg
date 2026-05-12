@@ -131,45 +131,56 @@ See [openwrt/package/README.md](/openwrt/package/README.md).
 ## WGANYCAST
 
 WG-protocol-aware dynamic anycast pool learning + per-packet UDP
-destination spray.  Two modes, no rule-level arguments — the pool is
-built at runtime from observed inbound WG traffic.
+destination spray.  No rule-level arguments — the pool is built at
+runtime from observed inbound WG traffic, keyed by WG session
+indices.
 
-### Modes
+v9 (current) replaces v3.x's synthetic-anchor design with **real WG
+flow cts as masters** plus **synthetic-marker expectations** for
+indexing.  No private rhashtable, no manual `nf_conntrack_alloc`,
+no `dport=0` synthetic anchors polluting `/proc/net/nf_conntrack`.
 
-- **`--learn`** — install in `raw` PREROUTING (priority -300, BEFORE
-  conntrack at -200).  Parses the WG type byte and extracts session
-  indices (`sender_index` / `receiver_index`) from the WG payload.
-  On type=2 RESP, allocates a per-session anchor conntrack (synthetic
-  5-tuple encoding `(Sa, our_idx)` in ORIGINAL, `(Sa, peer_idx)` in
-  REPLY, `dst.port = 0` so the tuple never collides with a real flow).
-  On every observed inbound, refreshes or inserts the packet's
-  `(anycast_src, anycast_sport)` into the anchor's **inline 4-entry
-  pool array** stored in the helper extension's 32-byte `data[]`
-  area.  LRU eviction on the 5th distinct door (rare in practice;
-  see Pool storage below).
-- **`--spray`** — install in `raw` OUTPUT (priority -300, BEFORE
-  conntrack at -200).  Looks up the anchor by WG `receiver_index`
-  (= `peer_idx` for outbound DATA/COOKIE).  Snapshots the live pool
-  entries under `anchor->lock`, picks one uniformly at random,
-  rewrites `iph->daddr` + `udph->dest` with incremental checksum
-  updates.  Empty pool → `XT_CONTINUE` (packet goes to WG's
-  configured `peer.endpoint` as-is — handles cold-start handshakes).
+### Mechanism
 
-Mutually exclusive in a single rule.  Typical deployment: one LEARN
-rule plus one SPRAY rule per WG listenPort.
+| Hook | Rule | Action |
+|---|---|---|
+| `raw` PREROUTING (any prio) | `-p udp --dport <listenPort> -j CT --helper WGANYCAST` | Attach the WGANYCAST conntrack helper to peer-initiated WG cts. |
+| `raw` OUTPUT (any prio) | `-p udp --dport <listenPort> -j CT --helper WGANYCAST` | Attach to us-initiated WG cts.  **Both directions are mandatory** — CT --helper attaches the helper at ct CREATION via template copy, so the direction that creates the ct must match. |
+| conntrack-helper, prio +300 | helper's `.help` callback (`wga_help`) | On RESP (in/out): claim ct as per-session master (set `IPS_FIXED_TIMEOUT_BIT` + 200 s timeout, **REFRESHED on every promotion AND every inbound DATA**), register two marker expectations under it (one keyed by `our_idx`, one by `peer_idx`).  On inbound DATA/COOKIE: look up master via `our_idx` marker, refresh master TTL + pool's (saddr, sport) entry. |
+| `raw` OUTPUT, prio −300 | `-p udp --sport <listenPort> -j WGANYCAST` | Parse WG header for the idx visible in the outbound packet (sender_idx for INIT/RESP = our_idx; receiver_idx for DATA/COOKIE = peer_idx), look up master via the corresponding marker, pick a random pool entry, rewrite `iph->daddr` + `udph->dest` with incremental checksum updates.  No master / empty pool → `XT_CONTINUE` (packet goes to WG's configured `peer.endpoint` as-is). |
+
+### Marker expectations
+
+Each master ct holds up to 8 markers (`expect_policy.max_expected
+= 8`), with `dst.protonum = WGA_MARKER_PROTO (253)`.  Real WG
+traffic is proto=UDP=17, so the kernel's expectation-matching
+code (which compares `tuple.dst.protonum` exactly, with no mask)
+never mistakes a real packet for one of our markers.
+
+```c
+src.l3num    = AF_INET
+src.u3.ip    = idx_as_be32       /* our_idx OR peer_idx */
+dst.protonum = WGA_MARKER_PROTO  /* 253 — RFC 3692 experimental */
+all other fields = 0             /* mask = 0xFFFFFFFF / 0xFFFF */
+```
+
+`max_expected = 8` is sized to span WG's transient session
+overlap.  During re-key both old and new sessions transmit DATA
+for up to `REJECT_AFTER_TIME = 180 s`; the OLD session's
+`peer_idx` is still on outbound DATA until the old key expires,
+so the OLD marker must remain registered alongside the NEW one.
+At 8 slots, up to 4 sessions' markers coexist per master — well
+above the 2 sessions WG actually allows concurrently.  The
+kernel does NOT auto-evict expectations on overflow (returns
+`-EMFILE`), so undersizing `max_expected` directly caps the
+outbound rewrite rate.
 
 ### Pool storage — inline in `help->data[32]`
 
-v3.2 stores the per-anchor pool **inline** in the helper extension's
-fixed 32-byte `data[]` area (`struct nf_conn_help.data`, exposed via
-`nfct_help_data()`).  No `nf_conntrack_expect` use anywhere — earlier
-versions abused expectations as a per-anchor list, which made every
-WG re-key collide with the predecessor anchor's expectation in the
-global expect hashtable (`-EBUSY`).  v3.2's anchor-private storage
-sidesteps the kernel's global tuple-uniqueness check entirely.
-
-Pool layout (8 bytes per entry × 4 entries = 32 bytes, fills
-`help->data[32]` exactly):
+The per-master pool is stored **inline** in the helper extension's
+fixed 32-byte `data[]` area (`struct nf_conn_help.data`, exposed
+via `nfct_help_data()`).  Pool layout (8 bytes per entry × 4
+entries = 32 bytes, fills `help->data[32]` exactly):
 
 ```c
 struct wga_pool_entry {
@@ -182,43 +193,55 @@ struct wga_pool_entry {
 LRU compare uses wrap-aware unsigned arithmetic: the 16-bit
 `last_seen_q8 = (jiffies >> 3)` wraps every ~524 s at HZ=1000.
 The unambiguous-compare half-window is 262 s — comfortably larger
-than the 200 s anchor lifetime, so any two slots can be ordered
-correctly within an anchor's life.  Serialised by `anchor->lock`
-(the `spinlock_t` already in `struct nf_conn`).
+than the 200 s master ct lifetime cap, so any two slots can be
+ordered correctly within a master's life.  Serialised by
+`master->lock` (the `spinlock_t` already in `struct nf_conn`).
 
-### Anchor lifecycle
+### Lifecycle
 
 | Object | Created | Reaped by |
 |---|---|---|
-| Anchor `nf_conn` | LEARN/SPRAY at first observed RESP | conntrack GC at 200 s (WG `REJECT_AFTER_TIME + 20 s`).  `IPS_FIXED_TIMEOUT_BIT` blocks refresh. |
-| Inline pool (4 × 8 B in `help->data[32]`) | Initialised zero by `nf_ct_helper_ext_add`; populated by LEARN | Freed automatically as part of the help extension when the anchor `nf_conn` is destroyed. |
-| Real child ct (anycast flow) | Standard conntrack hook on each new inbound/outbound tuple | UDP unreplied 30 s / stream 120 s.  Not linked to the anchor (we don't use expectations). |
+| Master ct (real WG flow) | First RESP through `wga_help` after the ct gains the helper extension | `IPS_FIXED_TIMEOUT_BIT` + 200 s TTL, REFRESHED on every promotion + every inbound DATA.  Active sessions stay alive indefinitely; idle sessions expire 200 s after last packet. |
+| Markers (`nf_conntrack_expect`) | At RESP, two per session (`our_idx` + `peer_idx`) | Destroyed by `nf_ct_remove_expectations(master)` when master ct is destroyed.  `expect_policy.timeout = 86400` is a far ceiling — master ct's 200 s TTL governs. |
+| Inline pool (4 × 8 B in `help->data[32]`) | Initialised zero by `nf_ct_helper_ext_add`; populated by `wga_help` on inbound DATA | Freed automatically as part of the help extension when the master ct is destroyed. |
+| Per-door cts (anycast doors) | Standard conntrack hook on each new inbound/outbound tuple | UDP unreplied 30 s / stream 120 s.  Independent of master; `ct->master` is never set. |
 
-No module-private kmalloc, no module-managed GC, no per-packet
-refresh dance, no `.destroy` callback on the helper.  A no-op
-`nf_conntrack_helper` (matching never-used UDP port 0) is
-registered to expose the 32-byte `data[]` area via
-`nf_ct_helper_ext_add`.  The helper carries a minimal
-`expect_policy` stub (`max_expected = 0`) because
-`nf_conntrack_helper_register` WARN_ON's on a NULL `expect_policy`;
-the stub is never read anywhere in v3.2.
+No module-private kmalloc, no module-managed GC, no `.destroy`
+callback on the helper.
+
+### Helper attach quirks
+
+- **No more sysctl auto-attach.**  Modern kernels (post-CVE-2017-7184)
+  removed `net.netfilter.nf_conntrack_helper` entirely.  The
+  `helper.tuple.dst.u.udp.port = htons(51821)` field no longer
+  causes any auto-attach; explicit CT --helper rules are the only
+  mechanism.
+
+- **`nf_ct_expect_init` NULL handling.**  The kernel's
+  `nf_ct_expect_init(exp, class, family, saddr, daddr, proto, src,
+  dst)` checks **only `saddr`** for NULL — the other three pointer
+  args (`daddr`, `src` port, `dst` port) are dereferenced
+  unconditionally via `memcpy(..., daddr, len)` and `*src` /
+  `*dst`.  Passing NULL for any of them → instant kernel NULL-ptr
+  panic.  `wga_register_marker` works around this by passing
+  pointers to zero-valued stack locals.
+
+- **`IPS_FIXED_TIMEOUT_BIT` write pattern.**  v9's first cut
+  guarded the TTL write with `test_and_set_bit(...)`, so the TTL
+  was set on the *first* promotion and never refreshed.  Re-keys
+  on the same ct fired promotion again but the TTL stayed at
+  `first_promotion + 200 s` — the ct died despite RESPs still
+  coming.  Current code uses `set_bit(...)` + unconditional
+  `WRITE_ONCE(ct->timeout, ...)` so every promotion AND every
+  inbound DATA pool refresh extends the TTL.
 
 ### Multi-peer on one WG interface
 
-Anchors are keyed by WG `our_idx` (32-bit session index, unique per
-active session on a device).  Two peers sharing the same listenPort
-get distinct anchors; LEARN/SPRAY for one session never affects the
-other.  No per-peer rule configuration needed.
-
-### Re-key handling via WG's overlap window
-
-WG re-keys every ~120 s (`REKEY_AFTER_TIME`).  `REJECT_AFTER_TIME =
-180 s` gives a ~60 s window where both old and new session indices
-are live: the new anchor's pool starts empty and refills from
-inbound traffic within the first keepalive cycle.  No special
-handling required — and unlike v3.1, there is no pool-inheritance
-code, because without `nf_conntrack_expect` use there is no global
-tuple table for the new anchor to clash with on its first insert.
+Markers are keyed by `our_idx` / `peer_idx` (32-bit WG session
+indices, unique per active session on a device).  Two peers
+sharing the same listenPort get distinct masters; spray for one
+session never reaches another session's pool.  No per-peer rule
+configuration needed.
 
 ### Example: WG over two Cloudflare Spectrum anycasts
 
@@ -226,91 +249,79 @@ Gateway maps both anycast IPs' UDP/59263 → backend's WG :51821.
 WG's `listenPort = 51821` on both ends.
 
 ```shell
-# Observe inbound, learn the anycast doors.  Self-installs the
-# per-session anchor + permanent expectations.
-iptables -t raw -A PREROUTING -p udp --dport 51821 -j WGANYCAST --learn
+# Attach helper to inbound WG cts (peer-initiated sessions).
+iptables -t raw -A PREROUTING -p udp --dport 51821 \
+  -j CT --helper WGANYCAST
 
-# Spray outbound across the learned doors.  Cold-start handshake
-# (no anchor yet) falls through to WG's configured peer.endpoint.
-iptables -t raw -A OUTPUT     -p udp --sport 51821 -j WGANYCAST --spray
+# Attach helper to outbound WG cts (us-initiated sessions).
+iptables -t raw -A OUTPUT     -p udp --dport 51821 \
+  -j CT --helper WGANYCAST
+
+# Spray outbound across learned doors.
+iptables -t raw -A OUTPUT     -p udp --sport 51821 -j WGANYCAST
 ```
 
-That's the entire ruleset — both directions of the flow are handled
-by the synthetic-anchor mechanism.  Port-translation by the gateway
-(e.g. anycast:59263 → backend:51821 in CF Spectrum) is learned
-implicitly because LEARN captures the observed source `(ip, port)`
-into the inline pool.
+Port-translation by the gateway (e.g. anycast:59263 →
+backend:51821 in CF Spectrum) is learned implicitly because
+`wga_help` captures the observed source `(ip, port)` into the
+inline pool on every inbound DATA.
 
 ### Diagnostics
 
-Anchors are visible through standard conntrack introspection; the
-inline pool is opaque to procfs (it's bytes inside `help->data`)
-but per-host aggregate counters are exposed via
-`/proc/net/wganycast_stats`.
-
 ```shell
-# Per-session anchors: `dport=0` is the synthetic-tuple signature.
-# `src=<Sa.ip>` is our local WG endpoint, `dst=<idx_as_ip>` decodes to
-# the session index (little-endian).  Anchors stay [UNREPLIED] for
-# life by design — the synthetic REPLY direction (dport=0) never
-# matches a real packet.
-grep 'sport=51821 dport=0' /proc/net/nf_conntrack
+# Helper-attachment state.  USE netlink (conntrack-tools), not
+# /proc/net/nf_conntrack — /proc hides the helper= field in some
+# kernel configs.
+nix-shell -p conntrack-tools --run \
+  "conntrack -L --proto udp -o extended | grep '51821'"
+#   ipv4 2 udp 17 175 src=... [ASSURED] mark=0 helper=WGANYCAST use=1
 
-# Live counters (LEARN / pool / SPRAY).  Health signature:
-#   spray_rewrote / spray_data ≈ 1.0          (every DATA rewritten)
-#   pool_match_refresh / total ≈ 0.7–0.9      (steady-state pool hot)
-#   pool_insert_evict ≈ 0                     (4-entry cap rarely hit)
+# Markers (one or more per active master, dst.protonum=253).
+sudo cat /proc/net/nf_conntrack_expect
+#   86399 proto=253 src=168.25.179.227 dst=0.0.0.0 PERMANENT
+#   ...
+
+# Live counters.  Health signature on a working host:
+#   spray_rewrote / spray_total      → ~0.9       (most outbound rewritten)
+#   spray_no_master / spray_total    → < 0.1      (cold-start + short transients)
+#   pool_match_refresh / inbound DATA→ 0.7-0.9    (steady-state pool hot)
+#   master_promote_lost              → near 0     (race losses rare)
+#   marker_register_fail             → 0          (max_expected sized right)
 cat /proc/net/wganycast_stats
-
-# Note: /proc/net/nf_conntrack_expect is EMPTY for our anchors.
-# v3.2 does not use the kernel expect API — pool storage is inline.
 ```
 
-Reading the `dst=<idx_as_ip>` field: convert four octets back to a
-32-bit value to get the session index.  Useful for correlating with
-`wg show <iface> peers` output.
+If `spray_no_master` is high (> 0.5 of `spray_total`), check in
+order:
 
-If the SPRAY pool stays empty after multiple peer connections
-(`pool_match_refresh` and `pool_insert_append` both at 0), check:
-
-1. **LEARN rule is in `raw` PREROUTING and BEFORE conntrack** —
-   priority must be ≤ −300.  Verify with
-   `iptables -t raw -L PREROUTING -n -v --line-numbers`.
-2. **WG packets actually arrive** — `tcpdump -i <wan> udp port <listenPort>`
-   on the host should show inbound RESP/DATA from anycast doors.
-3. **No iptables `-j DROP` upstream of the LEARN rule** — `raw`
-   PREROUTING runs first in the input path but a misplaced rule
-   could still preempt.
-4. **`anchor_missing` keeps climbing in stats** — first DATA
-   inbound arrived before our RESP-out created the anchor.
-   Indicates a peer-initiated handshake without a matching outbound
-   RESP yet.  Transient; resolves on the next handshake exchange.
+1. **Helper coverage** — `conntrack -L -o extended | grep 51821
+   | grep -c helper=WGANYCAST` should match the count of primary
+   WG cts (dport=51821 OR sport=51821).  Helper-less primary cts
+   indicate a missing CT --helper rule in one direction; you need
+   BOTH PREROUTING and OUTPUT covered.
+2. **Marker accumulation** — `wc -l /proc/net/nf_conntrack_expect`
+   should reach `2 × active_peers` quickly, and grow under re-key
+   load.  Stuck low → master cts are dying (TTL not refreshing).
+3. **`marker_register_fail` climbing** — `max_expected` too low
+   for current session churn.  Bump in `wga_exp_policy`.
 
 ### Notes
 
-- **Synthetic-tuple collision-free**: anchor tuples have
-  `dst.port = 0` (RFC-reserved, no real UDP flow uses it), so the
-  hashtable lookup by anchor tuple is guaranteed not to match real
-  packets.  Anchors appear in `/proc/net/nf_conntrack` with
-  `src=Sa.ip dst=<idx_as_ip> sport=Sa.port dport=0 [UNREPLIED]` —
-  the synthetic REPLY direction (also `dport=0`) can never be
-  observed, so `IPS_SEEN_REPLY_BIT` never gets set and the entry
-  stays `[UNREPLIED]` for its full life.  Functionally inert.
-- **Anti-poisoning**: LEARN only processes packets passing WG type
-  byte + size validation.  Attacker would need to forge the
-  receiver-side `our_idx` (32-bit value chosen by WG kernel at
-  handshake) AND match an in-pool slot — bounded by the 4-entry LRU
-  cap, legitimate anycast IPs displace attackers on next genuine
-  inbound.
-- **`iptables -j DNAT --random` is not equivalent**: `-j DNAT` runs
-  in `nat` and registers the mapping in conntrack, so every packet
-  of the same 5-tuple inherits the *first* random pick.  WGANYCAST
-  picks per-packet, with per-session pool isolation.
-- **Pre-v3 `--dest` / `--canonical` are gone**.  The static pool
-  enumeration and source-canonicalisation are replaced by dynamic
-  learning + the synthetic-tuple-anchor mechanism.
+- **Anti-poisoning**: `wga_help` only processes packets passing
+  WG type byte + size validation.  Attacker would need to forge
+  the receiver-side `our_idx` (32-bit value chosen by WG kernel at
+  handshake) AND match an in-pool slot — bounded by the 4-entry
+  LRU cap, legitimate anycast IPs displace attackers on next
+  genuine inbound.
+- **`iptables -j DNAT --random` is not equivalent**: `-j DNAT`
+  runs in `nat` and registers the mapping in conntrack, so every
+  packet of the same 5-tuple inherits the *first* random pick.
+  WGANYCAST picks per-packet, with per-session pool isolation.
+- **Pre-v3 `--dest` / `--canonical` and v3.x `--learn` /
+  `--spray` are gone**.  The bare `WGANYCAST` target takes no
+  arguments — its behaviour depends only on chain (PREROUTING vs
+  OUTPUT).
 - **IPv4 only.**  Same constraint as WGPTCP; IPv6 support would
-  need parallel paths in the anchor / expectation tuple builders.
+  need parallel paths in the marker tuple builders.
 
 
 ## WGPTCP
