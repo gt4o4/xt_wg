@@ -589,10 +589,14 @@ static int wga_help(struct sk_buff *skb, unsigned int protoff,
 			return NF_ACCEPT;
 		}
 
-		/* We've claimed master role (at least one marker succeeded). */
-		if (!test_and_set_bit(IPS_FIXED_TIMEOUT_BIT, &ct->status))
-			WRITE_ONCE(ct->timeout,
-				   jiffies + WGA_MASTER_TTL_SEC * HZ);
+		/* We've claimed master role (at least one marker succeeded).
+		 * Refresh TTL on EVERY promotion (including re-keys on the
+		 * same ct) so the ct doesn't expire mid-session and leave
+		 * spray without markers between expiry and next-ct + next-RESP.
+		 * Without the refresh, the ct dies hard at master_promote_time
+		 * + 200 s, killing all markers — even if RESPs keep coming. */
+		set_bit(IPS_FIXED_TIMEOUT_BIT, &ct->status);
+		WRITE_ONCE(ct->timeout, jiffies + WGA_MASTER_TTL_SEC * HZ);
 
 		atomic_inc(&wga_stat_master_promoted);
 
@@ -623,10 +627,18 @@ static int wga_help(struct sk_buff *skb, unsigned int protoff,
 
 	rcu_read_lock();
 	master = wga_find_master_rcu(net, pi.receiver_idx);
-	if (master)
+	if (master) {
 		wga_learn_door(master, iph->saddr, udph->source);
-	else
+		/* Refresh master TTL on every inbound DATA so active
+		 * sessions don't die at the 200 s cap.  WG keepalives
+		 * arrive every 25 s, so the refresh is frequent.  This
+		 * is the steady-state path that keeps master alive
+		 * between re-key cycles. */
+		WRITE_ONCE(master->timeout,
+			   jiffies + WGA_MASTER_TTL_SEC * HZ);
+	} else {
 		atomic_inc(&wga_stat_help_no_master);
+	}
 	rcu_read_unlock();
 
 	return NF_ACCEPT;
