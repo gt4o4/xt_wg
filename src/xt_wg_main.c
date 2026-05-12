@@ -85,6 +85,7 @@ module_exit(xt_wg_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("xtables WireGuard helpers: WGOBFS + WGANYCAST + WGPTCP");
 MODULE_AUTHOR("Wei Chen <weichen302@gmail.com>");
+MODULE_AUTHOR("Bingchen Gong <gongbingchen@gmail.com>");
 MODULE_VERSION("0.7.0");
 
 /* Backward-compat aliases — modprobe by old per-target name still

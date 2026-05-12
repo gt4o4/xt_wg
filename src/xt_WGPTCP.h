@@ -8,11 +8,13 @@
  * byte/packet state is read from `nf_conn_acct` on the underlying
  * UDP conntrack entry (no `ct->mark` or `ct->labels` claim).
  *
- *   ENCODE — rewrite outbound UDP packet to a TCP SYN that carries the
- *            UDP payload as TCP data, with a TFO cookie option (RFC 7413)
- *            as the protocol marker. Use in OUTPUT or POSTROUTING. Net
- *            packet growth: +20 bytes (TCP base 20 + 8-byte TFO option −
- *            UDP header 8).
+ *   ENCODE — rewrite outbound UDP packet to a WG-protocol-aware TCP
+ *            shape (SYN / SYN+ACK for the first outbound on each side,
+ *            PSH+ACK for subsequent data) with a TFO cookie option
+ *            (RFC 7413) as the protocol marker on handshake-shape
+ *            packets.  Use in OUTPUT mangle.  Net packet growth:
+ *            +40 bytes for handshake shape (48 B TCP header − 8 B UDP),
+ *            +24 bytes for data shape (32 B TCP header − 8 B UDP).
  *
  *   DECODE — recognise a fake-TCP packet by its TFO cookie marker and
  *            rewrite it back to UDP. MUST be installed in raw PREROUTING
