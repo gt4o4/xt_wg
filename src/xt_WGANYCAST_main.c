@@ -205,8 +205,23 @@ static inline struct wga_pool_inline *wga_pool_of(struct nf_conn *master)
 static int wga_help(struct sk_buff *skb, unsigned int protoff,
 		    struct nf_conn *ct, enum ip_conntrack_info ctinfo);
 
+/* WG can have 2 active sessions concurrently during re-key transition
+ * (the new session takes over after handshake completes, but the old
+ * session keeps sending DATA until REJECT_AFTER_TIME = 180 s).  Our
+ * outbound spray sees DATA from BOTH sessions during that window —
+ * old peer_idx + new peer_idx.  max_expected = 2 markers per master
+ * evicts the old peer_idx as soon as the new RESP registers new
+ * markers, so outbound DATA on the OLD session hits spray_no_master.
+ *
+ * Set max_expected = 8 so we can hold markers for up to ~4 sessions
+ * concurrently per master.  In steady state (one re-key cycle every
+ * 120 s, REJECT_AFTER_TIME = 180 s), only 2 sessions overlap, so 4
+ * markers are in active use; the extra 4 slots cover transient bursts
+ * (handshake retries, peer NAT churn).  Marker timeout (86400 s) and
+ * master ct TTL (200 s, refreshed) bound the total lifetime; old
+ * markers die when the master ct dies. */
 static const struct nf_conntrack_expect_policy wga_exp_policy = {
-	.max_expected = 2,
+	.max_expected = 8,
 	.timeout      = 86400,
 	.name         = "default",
 };
