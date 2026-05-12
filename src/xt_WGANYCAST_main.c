@@ -31,11 +31,14 @@
 #include <linux/skbuff.h>
 #include <linux/unaligned.h>
 #include <linux/refcount.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/netfilter_ipv4/ip_tables.h>
 #include <net/checksum.h>
 #include <net/ip.h>
 #include <net/udp.h>
+#include <net/net_namespace.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_expect.h>
@@ -44,6 +47,81 @@
 #include "xt_WGANYCAST.h"
 #include "xt_wg_common.h"
 #include "wg.h"
+
+/* ------------------------------------------------------------------
+ *   DEBUG instrumentation — temporary, revert after diagnose.
+ * ------------------------------------------------------------------ */
+static atomic_t wga_stat_learn_total          = ATOMIC_INIT(0);
+static atomic_t wga_stat_learn_parse_fail     = ATOMIC_INIT(0);
+static atomic_t wga_stat_learn_resp           = ATOMIC_INIT(0);
+static atomic_t wga_stat_learn_data           = ATOMIC_INIT(0);
+static atomic_t wga_stat_learn_cookie         = ATOMIC_INIT(0);
+static atomic_t wga_stat_learn_init_skip      = ATOMIC_INIT(0);
+static atomic_t wga_stat_anchor_missing       = ATOMIC_INIT(0);
+static atomic_t wga_stat_anchor_created       = ATOMIC_INIT(0);
+static atomic_t wga_stat_anchor_create_fail   = ATOMIC_INIT(0);
+static atomic_t wga_stat_exp_helper_null      = ATOMIC_INIT(0);
+static atomic_t wga_stat_exp_refresh          = ATOMIC_INIT(0);
+static atomic_t wga_stat_exp_alloc_fail       = ATOMIC_INIT(0);
+static atomic_t wga_stat_exp_add_success      = ATOMIC_INIT(0);
+static atomic_t wga_stat_exp_add_eexist       = ATOMIC_INIT(0);
+static atomic_t wga_stat_exp_add_ebusy        = ATOMIC_INIT(0);
+static atomic_t wga_stat_exp_add_other_err    = ATOMIC_INIT(0);
+static atomic_t wga_stat_exp_evict            = ATOMIC_INIT(0);
+static atomic_t wga_stat_pool_migrated_entries = ATOMIC_INIT(0);
+static atomic_t wga_stat_pool_migrate_calls   = ATOMIC_INIT(0);
+static atomic_t wga_stat_pool_migrate_skipped = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_total          = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_resp           = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_data           = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_anchor_missing = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_rewrote        = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_no_rewrite     = ATOMIC_INIT(0);
+
+static int wga_stats_show(struct seq_file *s, void *v)
+{
+	seq_printf(s, "learn_total           %d\n", atomic_read(&wga_stat_learn_total));
+	seq_printf(s, "learn_parse_fail      %d\n", atomic_read(&wga_stat_learn_parse_fail));
+	seq_printf(s, "learn_resp            %d\n", atomic_read(&wga_stat_learn_resp));
+	seq_printf(s, "learn_data            %d\n", atomic_read(&wga_stat_learn_data));
+	seq_printf(s, "learn_cookie          %d\n", atomic_read(&wga_stat_learn_cookie));
+	seq_printf(s, "learn_init_skip       %d\n", atomic_read(&wga_stat_learn_init_skip));
+	seq_printf(s, "anchor_missing        %d\n", atomic_read(&wga_stat_anchor_missing));
+	seq_printf(s, "anchor_created        %d\n", atomic_read(&wga_stat_anchor_created));
+	seq_printf(s, "anchor_create_fail    %d\n", atomic_read(&wga_stat_anchor_create_fail));
+	seq_printf(s, "exp_helper_null       %d\n", atomic_read(&wga_stat_exp_helper_null));
+	seq_printf(s, "exp_refresh           %d\n", atomic_read(&wga_stat_exp_refresh));
+	seq_printf(s, "exp_alloc_fail        %d\n", atomic_read(&wga_stat_exp_alloc_fail));
+	seq_printf(s, "exp_add_success       %d\n", atomic_read(&wga_stat_exp_add_success));
+	seq_printf(s, "exp_add_eexist        %d\n", atomic_read(&wga_stat_exp_add_eexist));
+	seq_printf(s, "exp_add_ebusy         %d\n", atomic_read(&wga_stat_exp_add_ebusy));
+	seq_printf(s, "exp_add_other_err     %d\n", atomic_read(&wga_stat_exp_add_other_err));
+	seq_printf(s, "exp_evict             %d\n", atomic_read(&wga_stat_exp_evict));
+	seq_printf(s, "pool_migrate_calls    %d\n", atomic_read(&wga_stat_pool_migrate_calls));
+	seq_printf(s, "pool_migrate_skipped  %d\n", atomic_read(&wga_stat_pool_migrate_skipped));
+	seq_printf(s, "pool_migrated_entries %d\n", atomic_read(&wga_stat_pool_migrated_entries));
+	seq_printf(s, "spray_total           %d\n", atomic_read(&wga_stat_spray_total));
+	seq_printf(s, "spray_resp            %d\n", atomic_read(&wga_stat_spray_resp));
+	seq_printf(s, "spray_data            %d\n", atomic_read(&wga_stat_spray_data));
+	seq_printf(s, "spray_anchor_missing  %d\n", atomic_read(&wga_stat_spray_anchor_missing));
+	seq_printf(s, "spray_rewrote         %d\n", atomic_read(&wga_stat_spray_rewrote));
+	seq_printf(s, "spray_no_rewrite      %d\n", atomic_read(&wga_stat_spray_no_rewrite));
+	return 0;
+}
+
+static int wga_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wga_stats_show, NULL);
+}
+
+static const struct proc_ops wga_stats_pops = {
+	.proc_open    = wga_stats_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+static struct proc_dir_entry *wga_stats_proc;
 
 /* Anchor lifetime — matches WG REJECT_AFTER_TIME + 20 s buffer.
  * The fixed timeout combined with IPS_FIXED_TIMEOUT_BIT prevents
@@ -219,23 +297,28 @@ static struct nf_conn *wga_create_anchor(struct net *net,
 
 	anchor = nf_conntrack_alloc(net, &nf_ct_zone_dflt, &orig, &repl,
 				    GFP_ATOMIC);
-	if (IS_ERR_OR_NULL(anchor))
+	if (IS_ERR_OR_NULL(anchor)) {
+		atomic_inc(&wga_stat_anchor_create_fail);
 		return NULL;
+	}
 
 	help = nf_ct_helper_ext_add(anchor, GFP_ATOMIC);
 	if (!help) {
+		atomic_inc(&wga_stat_anchor_create_fail);
 		nf_conntrack_free(anchor);
 		return NULL;
 	}
 
 	/* Attach the no-op helper so the kernel's __nf_ct_expect_check
-	 * accepts expectations registered under this anchor.  Bump our
-	 * own module's refcount to balance the put done by unhelp()
-	 * during nf_conntrack_helper_unregister or anchor destruction. */
-	if (!try_module_get(THIS_MODULE)) {
-		nf_conntrack_free(anchor);
-		return NULL;
-	}
+	 * accepts expectations registered under this anchor.  We do NOT
+	 * try_module_get(THIS_MODULE) here — modern kernels (≥5.16) no
+	 * longer wire a destroy callback to the helper extension, so a
+	 * matching module_put never fires and the refcount leaks.  Safety
+	 * on module unload is instead guaranteed by
+	 * nf_conntrack_helper_unregister() in xt_wganycast_module_exit:
+	 * it walks all conntracks, detaches our helper pointer, and
+	 * synchronize_rcu()s before returning so no CPU is still
+	 * dereferencing the helper when the module is freed. */
 	rcu_assign_pointer(help->helper, &wganycast_helper);
 
 	set_bit(IPS_CONFIRMED_BIT,     &anchor->status);
@@ -243,14 +326,14 @@ static struct nf_conn *wga_create_anchor(struct net *net,
 	WRITE_ONCE(anchor->timeout, jiffies + WGA_ANCHOR_TIMEOUT_SEC * HZ);
 
 	if (nf_conntrack_hash_check_insert(anchor)) {
-		/* Lost an allocate-race; drop our refs.  The winning anchor
-		 * is findable via wga_lookup_anchor in the caller. */
-		rcu_assign_pointer(help->helper, NULL);
-		module_put(THIS_MODULE);
+		/* Lost an allocate-race; the winning anchor is findable
+		 * via wga_lookup_anchor in the caller. */
+		atomic_inc(&wga_stat_anchor_create_fail);
 		nf_conntrack_free(anchor);
 		return NULL;
 	}
 
+	atomic_inc(&wga_stat_anchor_created);
 	return anchor;
 }
 
@@ -270,6 +353,113 @@ static struct nf_conn *wga_lookup_or_create_anchor(struct net *net,
 }
 
 /* --------------------------------------------------------------------
+ *   Pool inheritance on re-key clash
+ *
+ *   When a peer re-keys WG, our LEARN side creates a NEW anchor (new
+ *   our_idx).  But CF Spectrum's UDP NAT mapping survives WG re-key
+ *   (same client.NAT.IP:port → same CF backend port), so the new
+ *   anchor's first add hits an `-EBUSY` clash with the *old* anchor
+ *   that still holds the same (anycast_ip, anycast_port) tuple.
+ *
+ *   Rather than just losing the door, transfer the old anchor's whole
+ *   pool to the new anchor in one move:
+ *     - The conflicting tuple is now part of new's pool (the door we
+ *       were trying to register).
+ *     - Any other doors the peer was sending on are also inherited.
+ *     - Old anchor is left with an empty pool; it expires harmlessly
+ *       at its 200 s timeout.
+ *
+ *   Bounce protection: we only migrate FROM an older anchor TO a
+ *   newer one (comparing absolute timeout, since IPS_FIXED_TIMEOUT_BIT
+ *   keeps anchor->timeout stable).  Prevents ping-pong if both
+ *   sessions are receiving traffic during the WG re-key overlap.
+ * -------------------------------------------------------------------- */
+
+static int wga_steal_pool(struct net *net,
+			  const struct nf_conntrack_tuple *clash_tuple,
+			  struct nf_conn *new_master)
+{
+	struct nf_conntrack_expect *conflict, *exp;
+	struct nf_conn *old_master;
+	struct nf_conn_help *old_help, *new_help;
+	int moved = 0;
+
+	atomic_inc(&wga_stat_pool_migrate_calls);
+
+	conflict = nf_ct_expect_find_get(net, &nf_ct_zone_dflt, clash_tuple);
+	if (!conflict)
+		goto out_skip;
+	if (conflict->master == new_master) {
+		nf_ct_expect_put(conflict);
+		goto out_skip;
+	}
+	old_master = conflict->master;
+	if (!refcount_inc_not_zero(&old_master->ct_general.use)) {
+		nf_ct_expect_put(conflict);
+		goto out_skip;
+	}
+
+	spin_lock_bh(&nf_conntrack_expect_lock);
+
+	/* Re-validate under lock — another CPU may have raced us. */
+	if (conflict->master != old_master)
+		goto out_unlock;
+
+	old_help = nfct_help(old_master);
+	new_help = nfct_help(new_master);
+	if (!old_help || !new_help ||
+	    rcu_access_pointer(old_help->helper) != &wganycast_helper)
+		goto out_unlock;
+
+	/* Migrate only toward the newer anchor (larger absolute timeout). */
+	if (time_before(new_master->timeout, old_master->timeout))
+		goto out_unlock;
+
+	/* First pass: update each expectation's master pointer + refresh
+	 * timer.  The lnodes still chain through old's list; we only
+	 * touch fields the migration needs. */
+	hlist_for_each_entry(exp, &old_help->expectations, lnode) {
+		WRITE_ONCE(exp->master, new_master);
+		mod_timer(&exp->timeout,
+			  jiffies + WGA_EXPECT_TIMEOUT_SEC * HZ);
+		moved++;
+	}
+
+	/* Bulk-move the list head when new is empty (the common case
+	 * for a freshly-created anchor hitting -EBUSY on its first add).
+	 * Otherwise splice per-entry to preserve new's existing entries. */
+	if (hlist_empty(&new_help->expectations)) {
+		hlist_move_list(&old_help->expectations,
+				&new_help->expectations);
+	} else {
+		struct hlist_node *n;
+		hlist_for_each_entry_safe(exp, n,
+					  &old_help->expectations, lnode) {
+			hlist_del_rcu(&exp->lnode);
+			hlist_add_head_rcu(&exp->lnode,
+					   &new_help->expectations);
+		}
+	}
+
+	new_help->expecting[NF_CT_EXPECT_CLASS_DEFAULT] += moved;
+	old_help->expecting[NF_CT_EXPECT_CLASS_DEFAULT] -= moved;
+
+	atomic_add(moved, &wga_stat_pool_migrated_entries);
+
+out_unlock:
+	spin_unlock_bh(&nf_conntrack_expect_lock);
+	nf_ct_put(old_master);
+	nf_ct_expect_put(conflict);
+	if (moved == 0)
+		atomic_inc(&wga_stat_pool_migrate_skipped);
+	return moved;
+
+out_skip:
+	atomic_inc(&wga_stat_pool_migrate_skipped);
+	return 0;
+}
+
+/* --------------------------------------------------------------------
  *   Pool entry management — permanent expectations under the anchor
  * -------------------------------------------------------------------- */
 
@@ -284,8 +474,10 @@ static void wga_add_or_refresh_expectation(struct nf_conn *anchor,
 	union nf_inet_addr dst_addr = { .ip = sa_ip };
 	unsigned int count = 0;
 
-	if (!help)
+	if (!help) {
+		atomic_inc(&wga_stat_exp_helper_null);
 		return;
+	}
 
 	spin_lock_bh(&nf_conntrack_expect_lock);
 	hlist_for_each_entry(exp, &help->expectations, lnode) {
@@ -299,6 +491,7 @@ static void wga_add_or_refresh_expectation(struct nf_conn *anchor,
 	}
 
 	if (match) {
+		atomic_inc(&wga_stat_exp_refresh);
 		mod_timer(&match->timeout,
 			  jiffies + WGA_EXPECT_TIMEOUT_SEC * HZ);
 		spin_unlock_bh(&nf_conntrack_expect_lock);
@@ -309,16 +502,20 @@ static void wga_add_or_refresh_expectation(struct nf_conn *anchor,
 	 * the oldest now so we can safely call nf_ct_unexpect_related
 	 * after dropping the lock. */
 	if (count >= XT_WGANYCAST_POOL_MAX && oldest &&
-	    refcount_inc_not_zero(&oldest->use))
+	    refcount_inc_not_zero(&oldest->use)) {
 		evict = oldest;
+		atomic_inc(&wga_stat_exp_evict);
+	}
 	spin_unlock_bh(&nf_conntrack_expect_lock);
 
 	if (evict)
 		nf_ct_unexpect_related(evict);
 
 	exp = nf_ct_expect_alloc(anchor);
-	if (!exp)
+	if (!exp) {
+		atomic_inc(&wga_stat_exp_alloc_fail);
 		return;
+	}
 
 	nf_ct_expect_init(exp, NF_CT_EXPECT_CLASS_DEFAULT, AF_INET,
 			  &src_addr, &dst_addr,
@@ -328,9 +525,31 @@ static void wga_add_or_refresh_expectation(struct nf_conn *anchor,
 	exp->timeout.expires = jiffies + WGA_EXPECT_TIMEOUT_SEC * HZ;
 
 	/* nf_ct_expect_related returns 0 on success or -EEXIST on
-	 * dedup race.  Either way we drop our caller-ref; on success
-	 * the hashtable holds its own ref. */
-	(void)nf_ct_expect_related(exp, 0);
+	 * dedup race.  -EBUSY means the global expect hashtable already
+	 * has a clashing tuple under a different master (the pre-rekey
+	 * predecessor anchor for this peer, almost always) — try to
+	 * migrate that master's whole pool to us. */
+	{
+		int ret = nf_ct_expect_related(exp, 0);
+		switch (ret) {
+		case 0:
+			atomic_inc(&wga_stat_exp_add_success);
+			break;
+		case -EEXIST:
+		case -EALREADY:
+			atomic_inc(&wga_stat_exp_add_eexist);
+			break;
+		case -EBUSY:
+			atomic_inc(&wga_stat_exp_add_ebusy);
+			wga_steal_pool(nf_ct_net(anchor), &exp->tuple, anchor);
+			break;
+		default:
+			atomic_inc(&wga_stat_exp_add_other_err);
+			pr_warn_ratelimited("xt_wg: nf_ct_expect_related returned %d for anycast=%pI4:%u\n",
+					    ret, &anycast_ip, ntohs(anycast_port));
+			break;
+		}
+	}
 	nf_ct_expect_put(exp);
 }
 
@@ -404,8 +623,12 @@ static unsigned int wganycast_learn_v4(struct sk_buff *skb, struct net *net)
 	__be16 sa_port, anycast_port;
 	__le32 our_idx, peer_idx;
 
-	if (!wga_parse_packet(skb, &pi, &iph, &udph))
+	atomic_inc(&wga_stat_learn_total);
+
+	if (!wga_parse_packet(skb, &pi, &iph, &udph)) {
+		atomic_inc(&wga_stat_learn_parse_fail);
 		return XT_CONTINUE;
+	}
 
 	sa_ip        = iph->daddr;
 	sa_port      = udph->dest;
@@ -414,22 +637,32 @@ static unsigned int wganycast_learn_v4(struct sk_buff *skb, struct net *net)
 
 	switch (pi.wg_type) {
 	case WG_TYPE_RESP:
+		atomic_inc(&wga_stat_learn_resp);
 		our_idx  = pi.receiver_idx;
 		peer_idx = pi.sender_idx;
 		anchor = wga_lookup_or_create_anchor(net, sa_ip, sa_port,
 						     our_idx, peer_idx);
 		break;
 	case WG_TYPE_DATA:
+		atomic_inc(&wga_stat_learn_data);
+		our_idx = pi.receiver_idx;
+		anchor = wga_lookup_anchor(net, sa_ip, sa_port, our_idx);
+		break;
 	case WG_TYPE_COOKIE:
+		atomic_inc(&wga_stat_learn_cookie);
 		our_idx = pi.receiver_idx;
 		anchor = wga_lookup_anchor(net, sa_ip, sa_port, our_idx);
 		break;
 	default:
+		if (pi.wg_type == WG_TYPE_INIT)
+			atomic_inc(&wga_stat_learn_init_skip);
 		return XT_CONTINUE;
 	}
 
-	if (!anchor)
+	if (!anchor) {
+		atomic_inc(&wga_stat_anchor_missing);
 		return XT_CONTINUE;
+	}
 
 	wga_add_or_refresh_expectation(anchor, anycast_ip, anycast_port,
 				       sa_ip, sa_port);
@@ -450,6 +683,9 @@ static unsigned int wganycast_spray_v4(struct sk_buff *skb, struct net *net)
 	__be32 sa_ip;
 	__be16 sa_port;
 	__le32 idx;
+	bool did_rewrite;
+
+	atomic_inc(&wga_stat_spray_total);
 
 	if (!wga_parse_packet(skb, &pi, &iph, &udph))
 		return XT_CONTINUE;
@@ -459,10 +695,15 @@ static unsigned int wganycast_spray_v4(struct sk_buff *skb, struct net *net)
 
 	switch (pi.wg_type) {
 	case WG_TYPE_RESP:
+		atomic_inc(&wga_stat_spray_resp);
 		anchor = wga_lookup_or_create_anchor(net, sa_ip, sa_port,
 						     pi.sender_idx, pi.receiver_idx);
 		break;
 	case WG_TYPE_DATA:
+		atomic_inc(&wga_stat_spray_data);
+		idx = pi.receiver_idx;
+		anchor = wga_lookup_anchor(net, sa_ip, sa_port, idx);
+		break;
 	case WG_TYPE_COOKIE:
 		idx = pi.receiver_idx;
 		anchor = wga_lookup_anchor(net, sa_ip, sa_port, idx);
@@ -471,10 +712,16 @@ static unsigned int wganycast_spray_v4(struct sk_buff *skb, struct net *net)
 		return XT_CONTINUE;
 	}
 
-	if (!anchor)
+	if (!anchor) {
+		atomic_inc(&wga_stat_spray_anchor_missing);
 		return XT_CONTINUE;
+	}
 
-	wga_pick_and_rewrite(skb, iph, udph, anchor);
+	did_rewrite = wga_pick_and_rewrite(skb, iph, udph, anchor);
+	if (did_rewrite)
+		atomic_inc(&wga_stat_spray_rewrote);
+	else
+		atomic_inc(&wga_stat_spray_no_rewrite);
 	nf_ct_put(anchor);
 	return XT_CONTINUE;
 }
@@ -525,11 +772,23 @@ const unsigned int xt_wganycast_targets_n = ARRAY_SIZE(xt_wganycast_targets);
 
 int xt_wganycast_module_init(void)
 {
+	int rc;
+
 	wganycast_helper.me = THIS_MODULE;
-	return nf_conntrack_helper_register(&wganycast_helper);
+	rc = nf_conntrack_helper_register(&wganycast_helper);
+	if (rc)
+		return rc;
+
+	wga_stats_proc = proc_create("wganycast_stats", 0444,
+				     init_net.proc_net, &wga_stats_pops);
+	if (!wga_stats_proc)
+		pr_warn("xt_wg: failed to create /proc/net/wganycast_stats\n");
+	return 0;
 }
 
 void xt_wganycast_module_exit(void)
 {
+	if (wga_stats_proc)
+		proc_remove(wga_stats_proc);
 	nf_conntrack_helper_unregister(&wganycast_helper);
 }
