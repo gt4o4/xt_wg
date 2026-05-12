@@ -2,33 +2,39 @@
 /*
  * Author: Bingchen Gong <gongbingchen@gmail.com>
  *
- * xt_WGANYCAST v3.2 — dynamic anycast pool via inline per-anchor
- * storage in the helper extension's 32-byte data area.
- * See xt_WGANYCAST.h for protocol semantics.
+ * xt_WGANYCAST v9 — marker-only expectation, no synthetic conntracks.
  *
- * Use:
+ *   - Per-session **master** is the first WG ct that processes a
+ *     RESP message.  Pool storage lives inline in the master's
+ *     `nfct_help_data(master)` (the kernel's 32-byte
+ *     `nf_conn_help.data[]` area).
  *
- *   # raw PREROUTING — observe inbound WG packets, refresh-or-insert
- *   # the source (anycast_ip, sport) into the per-session anchor's
- *   # inline pool array
- *   iptables -t raw -A PREROUTING -p udp --dport 51821 -j WGANYCAST --learn
+ *   - Two synthetic marker `nf_conntrack_expect` per master, both
+ *     with `dst.protonum = WGA_MARKER_PROTO (253)` and
+ *     `NF_CT_EXPECT_PERMANENT`.  Marker 1 keyed by `our_idx` in
+ *     `src.u3.ip`; marker 2 keyed by `peer_idx`.  Both serve as
+ *     an O(1) `idx → master` index via `__nf_ct_expect_find`.
+ *     They never match real packets — real WG is proto=UDP,
+ *     marker is proto=253, and protonum is exact-compared with no
+ *     mask in `__nf_ct_tuple_dst_cmp`.
  *
- *   # raw OUTPUT — spray outbound WG packets across the pool array
- *   iptables -t raw -A OUTPUT -p udp --sport 51821 -j WGANYCAST --spray
+ *   - Helper is attached to WG cts via `iptables -t raw -j CT
+ *     --helper WGANYCAST` in PREROUTING (also via auto-attach if
+ *     sysctl `net.netfilter.nf_conntrack_helper=1`, helper.tuple
+ *     matches `dst.port=51821, proto=UDP`).  The helper's `.help`
+ *     callback runs at conntrack-helper priority +300 — does
+ *     master promotion + pool refresh on inbound packets.
  *
- * No per-rule pool configuration; per-session anchors are allocated
- * dynamically at RESP observation and self-reap via standard conntrack
- * GC after WG REJECT_AFTER_TIME (+ 20 s buffer).
+ *   - SPRAY xt target (raw OUTPUT, -300) parses WG header for the
+ *     session idx in the outbound packet and looks up the marker
+ *     to find master → snapshots pool → rewrites iph->daddr +
+ *     udph->dest with the chosen anycast door.
  *
- * A no-op `nf_conntrack_helper` is registered globally — `data_len`
- * tells the helper extension allocator to expose its 32-byte
- * `nf_conn_help->data[]` area to us.  We do NOT use
- * nf_conntrack_expect at all; the pool array lives inline in that
- * 32-byte area.  The helper's tuple matches UDP port 0 (never used by
- * real flows), so the auto-attach path never fires.  We assign the
- * helper to our synthetic anchors manually after
- * `nf_ct_helper_ext_add` to mark them as ours (used during
- * helper_unregister at module exit).
+ * Master ct lifetime: bounded above by 200 s via
+ * `IPS_FIXED_TIMEOUT_BIT`.  Markers + pool die with master via
+ * `nf_ct_remove_expectations(master)` in the conntrack destroy
+ * path.  Next inbound RESP after master expiry promotes a new
+ * master.
  */
 
 #include <linux/version.h>
@@ -44,10 +50,12 @@
 #include <net/checksum.h>
 #include <net/ip.h>
 #include <net/udp.h>
+#include <net/route.h>
 #include <net/net_namespace.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_helper.h>
+#include <net/netfilter/nf_conntrack_expect.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include "xt_WGANYCAST.h"
 #include "xt_wg_common.h"
@@ -56,43 +64,47 @@
 /* ------------------------------------------------------------------
  *   Observability counters — /proc/net/wganycast_stats
  * ------------------------------------------------------------------ */
-static atomic_t wga_stat_learn_total          = ATOMIC_INIT(0);
-static atomic_t wga_stat_learn_parse_fail     = ATOMIC_INIT(0);
-static atomic_t wga_stat_learn_resp           = ATOMIC_INIT(0);
-static atomic_t wga_stat_learn_data           = ATOMIC_INIT(0);
-static atomic_t wga_stat_learn_cookie         = ATOMIC_INIT(0);
-static atomic_t wga_stat_learn_init_skip      = ATOMIC_INIT(0);
-static atomic_t wga_stat_anchor_missing       = ATOMIC_INIT(0);
-static atomic_t wga_stat_anchor_created       = ATOMIC_INIT(0);
-static atomic_t wga_stat_anchor_create_fail   = ATOMIC_INIT(0);
+static atomic_t wga_stat_help_total           = ATOMIC_INIT(0);
+static atomic_t wga_stat_help_parse_fail      = ATOMIC_INIT(0);
+static atomic_t wga_stat_help_inbound_init    = ATOMIC_INIT(0);
+static atomic_t wga_stat_help_inbound_resp    = ATOMIC_INIT(0);
+static atomic_t wga_stat_help_inbound_data    = ATOMIC_INIT(0);
+static atomic_t wga_stat_help_inbound_cookie  = ATOMIC_INIT(0);
+static atomic_t wga_stat_help_outbound        = ATOMIC_INIT(0);
+static atomic_t wga_stat_help_no_master       = ATOMIC_INIT(0);
+static atomic_t wga_stat_master_promoted      = ATOMIC_INIT(0);
+static atomic_t wga_stat_master_promote_lost  = ATOMIC_INIT(0);
+static atomic_t wga_stat_marker_register_fail = ATOMIC_INIT(0);
 static atomic_t wga_stat_pool_match_refresh   = ATOMIC_INIT(0);
 static atomic_t wga_stat_pool_insert_append   = ATOMIC_INIT(0);
 static atomic_t wga_stat_pool_insert_evict    = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_total          = ATOMIC_INIT(0);
-static atomic_t wga_stat_spray_resp           = ATOMIC_INIT(0);
-static atomic_t wga_stat_spray_data           = ATOMIC_INIT(0);
-static atomic_t wga_stat_spray_anchor_missing = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_parse_fail     = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_skip_type      = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_no_master      = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_rewrote        = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_no_rewrite     = ATOMIC_INIT(0);
 
 static int wga_stats_show(struct seq_file *s, void *v)
 {
-	seq_printf(s, "learn_total           %d\n", atomic_read(&wga_stat_learn_total));
-	seq_printf(s, "learn_parse_fail      %d\n", atomic_read(&wga_stat_learn_parse_fail));
-	seq_printf(s, "learn_resp            %d\n", atomic_read(&wga_stat_learn_resp));
-	seq_printf(s, "learn_data            %d\n", atomic_read(&wga_stat_learn_data));
-	seq_printf(s, "learn_cookie          %d\n", atomic_read(&wga_stat_learn_cookie));
-	seq_printf(s, "learn_init_skip       %d\n", atomic_read(&wga_stat_learn_init_skip));
-	seq_printf(s, "anchor_missing        %d\n", atomic_read(&wga_stat_anchor_missing));
-	seq_printf(s, "anchor_created        %d\n", atomic_read(&wga_stat_anchor_created));
-	seq_printf(s, "anchor_create_fail    %d\n", atomic_read(&wga_stat_anchor_create_fail));
+	seq_printf(s, "help_total            %d\n", atomic_read(&wga_stat_help_total));
+	seq_printf(s, "help_parse_fail       %d\n", atomic_read(&wga_stat_help_parse_fail));
+	seq_printf(s, "help_inbound_init     %d\n", atomic_read(&wga_stat_help_inbound_init));
+	seq_printf(s, "help_inbound_resp     %d\n", atomic_read(&wga_stat_help_inbound_resp));
+	seq_printf(s, "help_inbound_data     %d\n", atomic_read(&wga_stat_help_inbound_data));
+	seq_printf(s, "help_inbound_cookie   %d\n", atomic_read(&wga_stat_help_inbound_cookie));
+	seq_printf(s, "help_outbound         %d\n", atomic_read(&wga_stat_help_outbound));
+	seq_printf(s, "help_no_master        %d\n", atomic_read(&wga_stat_help_no_master));
+	seq_printf(s, "master_promoted       %d\n", atomic_read(&wga_stat_master_promoted));
+	seq_printf(s, "master_promote_lost   %d\n", atomic_read(&wga_stat_master_promote_lost));
+	seq_printf(s, "marker_register_fail  %d\n", atomic_read(&wga_stat_marker_register_fail));
 	seq_printf(s, "pool_match_refresh    %d\n", atomic_read(&wga_stat_pool_match_refresh));
 	seq_printf(s, "pool_insert_append    %d\n", atomic_read(&wga_stat_pool_insert_append));
 	seq_printf(s, "pool_insert_evict     %d\n", atomic_read(&wga_stat_pool_insert_evict));
 	seq_printf(s, "spray_total           %d\n", atomic_read(&wga_stat_spray_total));
-	seq_printf(s, "spray_resp            %d\n", atomic_read(&wga_stat_spray_resp));
-	seq_printf(s, "spray_data            %d\n", atomic_read(&wga_stat_spray_data));
-	seq_printf(s, "spray_anchor_missing  %d\n", atomic_read(&wga_stat_spray_anchor_missing));
+	seq_printf(s, "spray_parse_fail      %d\n", atomic_read(&wga_stat_spray_parse_fail));
+	seq_printf(s, "spray_skip_type       %d\n", atomic_read(&wga_stat_spray_skip_type));
+	seq_printf(s, "spray_no_master       %d\n", atomic_read(&wga_stat_spray_no_master));
 	seq_printf(s, "spray_rewrote         %d\n", atomic_read(&wga_stat_spray_rewrote));
 	seq_printf(s, "spray_no_rewrite      %d\n", atomic_read(&wga_stat_spray_no_rewrite));
 	return 0;
@@ -112,16 +124,16 @@ static const struct proc_ops wga_stats_pops = {
 
 static struct proc_dir_entry *wga_stats_proc;
 
-/* Anchor lifetime — matches WG REJECT_AFTER_TIME + 20 s buffer.
+/* Master ct lifetime — matches WG REJECT_AFTER_TIME + 20 s buffer.
  * The fixed timeout combined with IPS_FIXED_TIMEOUT_BIT prevents
- * any refresh path from extending it.  Standard conntrack GC reaps
- * the anchor (and its inline pool, which lives inside the help
- * extension on the same nf_conn) once the timeout fires.
+ * any refresh path from extending it.  Without per-flow expectations
+ * keeping master alive via child refcounts (v8 design), master ALWAYS
+ * dies on its 200 s mark — matches v3.2's anchor lifetime exactly.
  */
-#define WGA_ANCHOR_TIMEOUT_SEC	200u
+#define WGA_MASTER_TTL_SEC	200u
 
 /* --------------------------------------------------------------------
- *   Inline pool — lives in nf_conn_help->data[32]
+ *   Inline pool — lives in nf_conn_help->data[32] on master ct
  *
  *   Each entry is 8 bytes packed; 4 entries fill the 32-byte area
  *   exactly.  An empty slot is marked by ip == 0 (no need for an
@@ -129,7 +141,7 @@ static struct proc_dir_entry *wga_stats_proc;
  *   tick value derived from `jiffies >> WGA_TIME_SHIFT` — the shift
  *   stretches the wrap window to ~524 s at HZ=1000, giving a 262 s
  *   half-window for unambiguous LRU compare that comfortably exceeds
- *   the 200 s anchor lifetime.
+ *   the 200 s master lifetime.
  * -------------------------------------------------------------------- */
 
 #define WGA_POOL_SIZE      4u
@@ -152,61 +164,68 @@ static_assert(sizeof(struct wga_pool_inline) <= 32,
 	      "wga_pool_inline must fit in nf_conn_help->data[32]");
 static_assert(sizeof(struct wga_pool_entry) == 8,
 	      "wga_pool_entry expected to be exactly 8 bytes (4+2+2)");
+static_assert(WGA_POOL_SIZE == XT_WGANYCAST_POOL_MAX,
+	      "pool size must match userspace-visible XT_WGANYCAST_POOL_MAX");
 
 static inline __u16 wga_now_q8(void)
 {
 	return (__u16)(jiffies >> WGA_TIME_SHIFT);
 }
 
-static inline struct wga_pool_inline *wga_pool_of(struct nf_conn *anchor)
+static inline struct wga_pool_inline *wga_pool_of(struct nf_conn *master)
 {
-	return (struct wga_pool_inline *)nfct_help_data(anchor);
+	return (struct wga_pool_inline *)nfct_help_data(master);
 }
 
 /* --------------------------------------------------------------------
- *   No-op helper.
+ *   Helper definition
  *
- *   `.help` is non-NULL only because the helper API requires it;
- *   it never fires for real packets (synthetic dst.port=0 prevents
- *   auto-attach).  `.data_len` claims the full 32 bytes of
- *   `nf_conn_help->data[]` for our inline pool.  No .destroy
- *   callback — the pool is freed automatically as part of the help
- *   extension when the anchor `nf_conn` is destroyed.
+ *   `helper.tuple.dst.u.udp.port = htons(51821)` enables auto-attach
+ *   if `net.netfilter.nf_conntrack_helper=1`.  For sysctl=0 (kernel
+ *   default), the NixOS module emits `-j CT --helper WGANYCAST` in
+ *   raw PREROUTING which explicitly attaches the helper via xt_CT
+ *   template regardless of sysctl.
+ *
+ *   `helper.data_len = sizeof(struct wga_pool_inline)` reserves the
+ *   32-byte data[] area on every helped ct's `nf_conn_help`.  Pool
+ *   only lives on master; other helped cts of the same session have
+ *   the area but it stays zeroed.
+ *
+ *   `expect_policy.max_expected = 2` allows the two markers we
+ *   register per master (one keyed by our_idx, one by peer_idx).
+ *   `expect_policy.timeout = 86400` is a far-future ceiling — master
+ *   FIXED_TIMEOUT (200 s) always fires first, removing markers via
+ *   `nf_ct_remove_expectations` long before this timer would.
+ *
+ *   No `.destroy` callback — kernel walks `master_help->expectations`
+ *   and destroys our markers automatically when master ct is
+ *   destroyed.
  * -------------------------------------------------------------------- */
 
-static int wganycast_help_noop(struct sk_buff *skb, unsigned int protoff,
-			       struct nf_conn *ct,
-			       enum ip_conntrack_info ctinfo)
-{
-	return NF_ACCEPT;
-}
+static int wga_help(struct sk_buff *skb, unsigned int protoff,
+		    struct nf_conn *ct, enum ip_conntrack_info ctinfo);
 
-/* Even though we never call nf_ct_expect_related, the kernel's
- * nf_conntrack_helper_register() asserts at registration time that
- * a helper has a non-NULL expect_policy.  Provide a minimal stub
- * (max_expected = 0) so registration succeeds.  Never actually used
- * — we don't call into the expect API anywhere in v3.2. */
-static const struct nf_conntrack_expect_policy wganycast_exp_policy = {
-	.max_expected = 0,
-	.timeout      = 0,
+static const struct nf_conntrack_expect_policy wga_exp_policy = {
+	.max_expected = 2,
+	.timeout      = 86400,
 	.name         = "default",
 };
 
-static struct nf_conntrack_helper wganycast_helper __read_mostly = {
+static struct nf_conntrack_helper wga_helper __read_mostly = {
 	.name = "WGANYCAST",
 	.tuple = {
 		.src.l3num      = AF_INET,
 		.dst.protonum   = IPPROTO_UDP,
-		.dst.u.udp.port = 0,	/* never-match port */
+		.dst.u.udp.port = __constant_htons(51821),
 	},
 	.expect_class_max = 0,
-	.expect_policy    = &wganycast_exp_policy,
-	.help             = wganycast_help_noop,
+	.expect_policy    = &wga_exp_policy,
+	.help             = wga_help,
 	.data_len         = sizeof(struct wga_pool_inline),
 };
 
 /* --------------------------------------------------------------------
- *   WG packet parsing
+ *   WG packet parsing — unchanged from v3.2
  * -------------------------------------------------------------------- */
 
 struct wga_pkt_info {
@@ -286,122 +305,88 @@ static bool wga_parse_packet(struct sk_buff *skb,
 }
 
 /* --------------------------------------------------------------------
- *   Synthetic-tuple helpers
+ *   Marker expectation — synthetic tuple keyed by session idx
  *
- * Anchor tuples encode session indices in dst.u3.ip:
- *   ORIGINAL.dst.u3.ip = our_idx_as_be32
- *   REPLY   .dst.u3.ip = peer_idx_as_be32
- * Both directions share src = (Sa_ip, Sa_port), proto = UDP, dst.port = 0.
+ *   Tuple shape:
+ *     src.l3num    = AF_INET
+ *     src.u3.ip    = idx          (mask 0xFFFFFFFF — exact match)
+ *     dst.protonum = WGA_MARKER_PROTO (253)   (exact, no mask)
+ *     all other fields = 0        (mask = 0 — wildcard)
+ *
+ *   Real packets cannot match because they all have proto=UDP, and
+ *   protonum is exact-compared with no mask in `__nf_ct_tuple_dst_cmp`.
+ *   The kernel also hashes markers (proto=253) into different buckets
+ *   from real UDP traffic, so it never even visually scans them.
  * -------------------------------------------------------------------- */
 
-static void wga_build_tuple(struct nf_conntrack_tuple *t,
-			    __be32 sa_ip, __be16 sa_port,
-			    __le32 idx, u8 dir)
+static void wga_marker_tuple(struct nf_conntrack_tuple *t, __le32 idx)
 {
 	memset(t, 0, sizeof(*t));
-	t->src.l3num         = AF_INET;
-	t->src.u3.ip         = sa_ip;
-	t->src.u.udp.port    = sa_port;
-	t->dst.u3.ip         = (__force __be32)idx;
-	t->dst.u.udp.port    = 0;
-	t->dst.protonum      = IPPROTO_UDP;
-	t->dst.dir           = dir;
+	t->src.l3num    = AF_INET;
+	t->src.u3.ip    = (__force __be32)idx;
+	t->dst.protonum = WGA_MARKER_PROTO;
 }
 
-/* --------------------------------------------------------------------
- *   Anchor lifecycle
- * -------------------------------------------------------------------- */
+static int wga_register_marker(struct nf_conn *master, __le32 idx)
+{
+	struct nf_conntrack_expect *exp;
+	union nf_inet_addr saddr_idx;
+	/* Kernel 7.0.3's nf_ct_expect_init dereferences daddr/src/dst
+	 * UNCONDITIONALLY (only saddr has a NULL check).  Passing NULL
+	 * for any of these → instant null-ptr panic.  Pass zero-valued
+	 * pointers so the deref reads from valid stack locations.  The
+	 * resulting tuple dst.u3 = 0 / src.port = 0 / dst.port = 0 are
+	 * all exact-matched (mask 0xFFFFFFFF / 0xFFFF), but real WG
+	 * packets always have non-zero values for these fields, so the
+	 * marker never matches real traffic. */
+	union nf_inet_addr daddr_zero = { };
+	__be16 port_zero = 0;
+	int rc;
 
-static struct nf_conn *wga_lookup_anchor(struct net *net,
-					 __be32 sa_ip, __be16 sa_port,
-					 __le32 idx)
+	exp = nf_ct_expect_alloc(master);
+	if (!exp)
+		return -ENOMEM;
+
+	saddr_idx.ip = (__force __be32)idx;
+	nf_ct_expect_init(exp, NF_CT_EXPECT_CLASS_DEFAULT, AF_INET,
+			  &saddr_idx,        /* src.ip = idx, mask 0xFFFFFFFF */
+			  &daddr_zero,       /* dst.ip = 0, mask 0xFFFFFFFF   */
+			  WGA_MARKER_PROTO,  /* sentinel — never real         */
+			  &port_zero,        /* src.port = 0, mask 0xFFFF     */
+			  &port_zero);       /* dst.port = 0, mask 0xFFFF     */
+	exp->flags  = NF_CT_EXPECT_PERMANENT;
+	exp->helper = NULL;  /* marker never matches a real packet */
+
+	rc = nf_ct_expect_related(exp, 0);
+	nf_ct_expect_put(exp);
+	return rc;  /* 0 = registered, -EBUSY = race lost, -ENOMEM */
+}
+
+/* Caller MUST hold rcu_read_lock.  Returned master is valid only
+ * within the RCU read section (or until caller takes
+ * `nf_conntrack_get` on it). */
+static struct nf_conn *wga_find_master_rcu(struct net *net, __le32 idx)
 {
 	struct nf_conntrack_tuple t;
-	struct nf_conntrack_tuple_hash *h;
+	struct nf_conntrack_expect *exp;
 
-	wga_build_tuple(&t, sa_ip, sa_port, idx, IP_CT_DIR_ORIGINAL);
-	h = nf_conntrack_find_get(net, &nf_ct_zone_dflt, &t);
-	if (!h)
-		return NULL;
-	return nf_ct_tuplehash_to_ctrack(h);
-}
-
-static struct nf_conn *wga_create_anchor(struct net *net,
-					 __be32 sa_ip, __be16 sa_port,
-					 __le32 our_idx, __le32 peer_idx)
-{
-	struct nf_conntrack_tuple orig, repl;
-	struct nf_conn *anchor;
-	struct nf_conn_help *help;
-
-	wga_build_tuple(&orig, sa_ip, sa_port, our_idx, IP_CT_DIR_ORIGINAL);
-	wga_build_tuple(&repl, sa_ip, sa_port, peer_idx, IP_CT_DIR_REPLY);
-
-	anchor = nf_conntrack_alloc(net, &nf_ct_zone_dflt, &orig, &repl,
-				    GFP_ATOMIC);
-	if (IS_ERR_OR_NULL(anchor)) {
-		atomic_inc(&wga_stat_anchor_create_fail);
-		return NULL;
-	}
-
-	/* Allocate the help extension to expose its zero-initialised
-	 * 32-byte data[] area for our pool.  nf_ct_ext_add zeroes new
-	 * extension memory, so every slot starts with ip == 0 (free). */
-	help = nf_ct_helper_ext_add(anchor, GFP_ATOMIC);
-	if (!help) {
-		atomic_inc(&wga_stat_anchor_create_fail);
-		nf_conntrack_free(anchor);
-		return NULL;
-	}
-
-	/* Mark this anchor as ours.  Setting help->helper is what
-	 * nf_conntrack_helper_unregister() walks for at module exit so
-	 * the helper pointer is detached before the module is freed. */
-	rcu_assign_pointer(help->helper, &wganycast_helper);
-
-	set_bit(IPS_CONFIRMED_BIT,     &anchor->status);
-	set_bit(IPS_FIXED_TIMEOUT_BIT, &anchor->status);
-	WRITE_ONCE(anchor->timeout, jiffies + WGA_ANCHOR_TIMEOUT_SEC * HZ);
-
-	if (nf_conntrack_hash_check_insert(anchor)) {
-		/* Lost an allocate-race; the winning anchor is findable
-		 * via wga_lookup_anchor in the caller. */
-		atomic_inc(&wga_stat_anchor_create_fail);
-		nf_conntrack_free(anchor);
-		return NULL;
-	}
-
-	atomic_inc(&wga_stat_anchor_created);
-	return anchor;
-}
-
-static struct nf_conn *wga_lookup_or_create_anchor(struct net *net,
-						   __be32 sa_ip, __be16 sa_port,
-						   __le32 our_idx, __le32 peer_idx)
-{
-	struct nf_conn *ct;
-
-	ct = wga_lookup_anchor(net, sa_ip, sa_port, our_idx);
-	if (ct)
-		return ct;
-	ct = wga_create_anchor(net, sa_ip, sa_port, our_idx, peer_idx);
-	if (ct)
-		return ct;
-	return wga_lookup_anchor(net, sa_ip, sa_port, our_idx);
+	wga_marker_tuple(&t, idx);
+	exp = __nf_ct_expect_find(net, &nf_ct_zone_dflt, &t);
+	return exp ? exp->master : NULL;
 }
 
 /* --------------------------------------------------------------------
- *   Pool maintenance — inline array in help->data[]
+ *   Pool maintenance — inline array in master->help->data[]
  *
  *   wga_learn_door: refresh existing entry, append into free slot, or
  *   evict the LRU (smallest last_seen, wrap-aware unsigned compare).
- *   Serialised via the anchor `nf_conn`'s own spinlock.
+ *   Serialised via master `nf_conn`'s own spinlock.
  * -------------------------------------------------------------------- */
 
-static void wga_learn_door(struct nf_conn *anchor,
+static void wga_learn_door(struct nf_conn *master,
 			   __be32 anycast_ip, __be16 anycast_port)
 {
-	struct wga_pool_inline *p = wga_pool_of(anchor);
+	struct wga_pool_inline *p = wga_pool_of(master);
 	int i, free_idx = -1, oldest_idx = -1;
 	__u16 now_q8 = wga_now_q8();
 	__u16 oldest_age = 0;
@@ -409,7 +394,7 @@ static void wga_learn_door(struct nf_conn *anchor,
 	if (!p)
 		return;
 
-	spin_lock_bh(&anchor->lock);
+	spin_lock_bh(&master->lock);
 
 	for (i = 0; i < WGA_POOL_SIZE; i++) {
 		struct wga_pool_entry *e = &p->slot[i];
@@ -423,7 +408,7 @@ static void wga_learn_door(struct nf_conn *anchor,
 		if (e->ip == anycast_ip && e->port == anycast_port) {
 			e->last_seen_q8 = now_q8;
 			atomic_inc(&wga_stat_pool_match_refresh);
-			spin_unlock_bh(&anchor->lock);
+			spin_unlock_bh(&master->lock);
 			return;
 		}
 		/* Wrap-aware "age = now - last_seen": bigger age = older. */
@@ -447,21 +432,21 @@ static void wga_learn_door(struct nf_conn *anchor,
 		atomic_inc(&wga_stat_pool_insert_evict);
 	}
 
-	spin_unlock_bh(&anchor->lock);
+	spin_unlock_bh(&master->lock);
 }
 
 /* --------------------------------------------------------------------
  *   Pick from pool + rewrite outbound packet
  *
- *   Snapshot the live entries under the anchor lock, then do the
+ *   Snapshot the live entries under master's lock, then do the
  *   random pick + checksum rewrite unlocked.  Short critical section.
  * -------------------------------------------------------------------- */
 
 static bool wga_pick_and_rewrite(struct sk_buff *skb,
 				 struct iphdr *iph, struct udphdr *udph,
-				 struct nf_conn *anchor)
+				 struct nf_conn *master)
 {
-	struct wga_pool_inline *p = wga_pool_of(anchor);
+	struct wga_pool_inline *p = wga_pool_of(master);
 	struct wga_pool_entry candidates[WGA_POOL_SIZE];
 	int i, n = 0;
 	__be32 old_addr, new_addr;
@@ -471,12 +456,12 @@ static bool wga_pick_and_rewrite(struct sk_buff *skb,
 	if (!p)
 		return false;
 
-	spin_lock_bh(&anchor->lock);
+	spin_lock_bh(&master->lock);
 	for (i = 0; i < WGA_POOL_SIZE; i++) {
 		if (p->slot[i].ip != 0)
 			candidates[n++] = p->slot[i];
 	}
-	spin_unlock_bh(&anchor->lock);
+	spin_unlock_bh(&master->lock);
 
 	if (n == 0)
 		return false;
@@ -504,160 +489,224 @@ static bool wga_pick_and_rewrite(struct sk_buff *skb,
 }
 
 /* --------------------------------------------------------------------
- *   LEARN handler — raw PREROUTING, priority -300
+ *   wga_help — conntrack-helper callback, runs at priority +300 for
+ *   every packet of every WG-helped ct (inbound and outbound).
+ *
+ *   On INBOUND RESP: register both markers, promote ct to master,
+ *   initialize pool with this packet's (saddr, sport).
+ *
+ *   On OUTBOUND RESP: same — register both markers under ct.  No
+ *   pool refresh (outbound saddr is our own IP, useless as pool
+ *   entry).
+ *
+ *   On INBOUND DATA/COOKIE: look up our_idx marker → master.
+ *   Refresh master's pool with this packet's (saddr, sport).
+ *
+ *   On OUTBOUND DATA/COOKIE: stats only.  SPRAY at raw OUTPUT
+ *   already handled rewrite; nothing to do here.
+ *
+ *   On INIT (either direction): only one idx known.  Skip — wait
+ *   for RESP to register both markers.
  * -------------------------------------------------------------------- */
 
-static unsigned int wganycast_learn_v4(struct sk_buff *skb, struct net *net)
+static int wga_help(struct sk_buff *skb, unsigned int protoff,
+		    struct nf_conn *ct, enum ip_conntrack_info ctinfo)
 {
 	struct wga_pkt_info pi;
 	struct iphdr *iph;
 	struct udphdr *udph;
-	struct nf_conn *anchor;
-	__be32 sa_ip, anycast_ip;
-	__be16 sa_port, anycast_port;
-	__le32 our_idx, peer_idx;
+	struct net *net = nf_ct_net(ct);
+	struct nf_conn *master;
+	bool is_inbound;
 
-	atomic_inc(&wga_stat_learn_total);
+	atomic_inc(&wga_stat_help_total);
 
 	if (!wga_parse_packet(skb, &pi, &iph, &udph)) {
-		atomic_inc(&wga_stat_learn_parse_fail);
-		return XT_CONTINUE;
+		atomic_inc(&wga_stat_help_parse_fail);
+		return NF_ACCEPT;
 	}
 
-	sa_ip        = iph->daddr;
-	sa_port      = udph->dest;
-	anycast_ip   = iph->saddr;
-	anycast_port = udph->source;
+	/* Direction: packet destined to a locally-assigned IP → inbound. */
+	is_inbound = (inet_addr_type(net, iph->daddr) == RTN_LOCAL);
 
+	if (pi.wg_type == WG_TYPE_RESP) {
+		/* RESP carries both indexes.  Determine which sender-side
+		 * value is "our_idx" vs "peer_idx" based on direction.
+		 *
+		 *   Inbound RESP  (peer responds to our INIT):
+		 *     sender_idx   = peer's new id  (peer_idx)
+		 *     receiver_idx = echo of our INIT's sender_idx (our_idx)
+		 *
+		 *   Outbound RESP (we respond to peer's INIT):
+		 *     sender_idx   = our new id      (our_idx)
+		 *     receiver_idx = echo of peer's INIT sender_idx (peer_idx)
+		 */
+		__le32 our_idx, peer_idx;
+		int rc_our, rc_peer;
+
+		if (is_inbound) {
+			atomic_inc(&wga_stat_help_inbound_resp);
+			peer_idx = pi.sender_idx;
+			our_idx  = pi.receiver_idx;
+		} else {
+			atomic_inc(&wga_stat_help_outbound);
+			our_idx  = pi.sender_idx;
+			peer_idx = pi.receiver_idx;
+		}
+
+		/* Check for existing master first.  Keep RCU held across
+		 * wga_learn_door so master's refcount-via-expectation
+		 * stays valid for the entire use — releasing RCU before
+		 * the deref would be a use-after-free if the marker was
+		 * reclaimed between find and use.  wga_learn_door takes
+		 * a spinlock but never sleeps, so it's safe under RCU. */
+		rcu_read_lock();
+		master = wga_find_master_rcu(net, our_idx);
+		if (master) {
+			/* Re-handshake on existing session: refresh pool. */
+			if (is_inbound)
+				wga_learn_door(master, iph->saddr, udph->source);
+			rcu_read_unlock();
+			return NF_ACCEPT;
+		}
+		rcu_read_unlock();
+
+		/* No master yet — claim `ct` as master and register both
+		 * markers under it. */
+		rc_our  = wga_register_marker(ct, our_idx);
+		rc_peer = wga_register_marker(ct, peer_idx);
+		if (rc_our != 0 && rc_peer != 0) {
+			/* Both failed; another CPU likely won the race.
+			 * Find the winner and refresh its pool. */
+			atomic_inc(&wga_stat_marker_register_fail);
+			rcu_read_lock();
+			master = wga_find_master_rcu(net, our_idx);
+			if (master && is_inbound)
+				wga_learn_door(master, iph->saddr, udph->source);
+			if (master)
+				atomic_inc(&wga_stat_master_promote_lost);
+			rcu_read_unlock();
+			return NF_ACCEPT;
+		}
+
+		/* We've claimed master role (at least one marker succeeded). */
+		if (!test_and_set_bit(IPS_FIXED_TIMEOUT_BIT, &ct->status))
+			WRITE_ONCE(ct->timeout,
+				   jiffies + WGA_MASTER_TTL_SEC * HZ);
+
+		atomic_inc(&wga_stat_master_promoted);
+
+		if (is_inbound)
+			wga_learn_door(ct, iph->saddr, udph->source);
+		return NF_ACCEPT;
+	}
+
+	/* Non-RESP: outbound is stats-only. */
+	if (!is_inbound) {
+		atomic_inc(&wga_stat_help_outbound);
+		return NF_ACCEPT;
+	}
+
+	/* Inbound INIT: only peer_idx known (sender_idx); no marker
+	 * registration without our_idx.  Wait for RESP. */
+	if (pi.wg_type == WG_TYPE_INIT) {
+		atomic_inc(&wga_stat_help_inbound_init);
+		return NF_ACCEPT;
+	}
+
+	/* Inbound DATA/COOKIE: receiver_idx = our_idx.  Look up our_idx
+	 * marker → master, refresh master's pool. */
 	switch (pi.wg_type) {
-	case WG_TYPE_RESP:
-		atomic_inc(&wga_stat_learn_resp);
-		our_idx  = pi.receiver_idx;
-		peer_idx = pi.sender_idx;
-		anchor = wga_lookup_or_create_anchor(net, sa_ip, sa_port,
-						     our_idx, peer_idx);
-		break;
-	case WG_TYPE_DATA:
-		atomic_inc(&wga_stat_learn_data);
-		our_idx = pi.receiver_idx;
-		anchor = wga_lookup_anchor(net, sa_ip, sa_port, our_idx);
-		break;
-	case WG_TYPE_COOKIE:
-		atomic_inc(&wga_stat_learn_cookie);
-		our_idx = pi.receiver_idx;
-		anchor = wga_lookup_anchor(net, sa_ip, sa_port, our_idx);
-		break;
-	default:
-		if (pi.wg_type == WG_TYPE_INIT)
-			atomic_inc(&wga_stat_learn_init_skip);
-		return XT_CONTINUE;
+	case WG_TYPE_DATA:    atomic_inc(&wga_stat_help_inbound_data);   break;
+	case WG_TYPE_COOKIE:  atomic_inc(&wga_stat_help_inbound_cookie); break;
 	}
 
-	if (!anchor) {
-		atomic_inc(&wga_stat_anchor_missing);
-		return XT_CONTINUE;
-	}
+	rcu_read_lock();
+	master = wga_find_master_rcu(net, pi.receiver_idx);
+	if (master)
+		wga_learn_door(master, iph->saddr, udph->source);
+	else
+		atomic_inc(&wga_stat_help_no_master);
+	rcu_read_unlock();
 
-	wga_learn_door(anchor, anycast_ip, anycast_port);
-	nf_ct_put(anchor);
-	return XT_CONTINUE;
+	return NF_ACCEPT;
 }
 
 /* --------------------------------------------------------------------
- *   SPRAY handler — raw OUTPUT, priority -300
+ *   SPRAY xt target — raw OUTPUT, priority -300.
+ *
+ *   Pre-conntrack hook → skb has no ct yet.  Parse the WG header
+ *   directly, derive the session idx visible in this outbound packet,
+ *   look up the marker → master, snapshot pool, rewrite.
+ *
+ *   Idx semantics per outbound message type:
+ *     INIT:   sender_idx   = our_idx   (we initiate)
+ *     RESP:   sender_idx   = our_idx   (we respond)
+ *     DATA:   receiver_idx = peer_idx  (peer is recipient)
+ *     COOKIE: receiver_idx = peer_idx  (we echo peer's idx)
+ *
+ *   The two markers (our_idx-keyed and peer_idx-keyed) under each
+ *   master mean either lookup type resolves to the same master.
  * -------------------------------------------------------------------- */
 
-static unsigned int wganycast_spray_v4(struct sk_buff *skb, struct net *net)
+static unsigned int wganycast_target_v4(struct sk_buff *skb,
+					const struct xt_action_param *par)
 {
+	struct net *net = xt_net(par);
 	struct wga_pkt_info pi;
 	struct iphdr *iph;
 	struct udphdr *udph;
-	struct nf_conn *anchor;
-	__be32 sa_ip;
-	__be16 sa_port;
-	__le32 idx;
-	bool did_rewrite;
+	struct nf_conn *master;
+	__le32 lookup_idx;
 
 	atomic_inc(&wga_stat_spray_total);
 
-	if (!wga_parse_packet(skb, &pi, &iph, &udph))
+	if (!wga_parse_packet(skb, &pi, &iph, &udph)) {
+		atomic_inc(&wga_stat_spray_parse_fail);
 		return XT_CONTINUE;
-
-	sa_ip   = iph->saddr;
-	sa_port = udph->source;
+	}
 
 	switch (pi.wg_type) {
+	case WG_TYPE_INIT:
 	case WG_TYPE_RESP:
-		atomic_inc(&wga_stat_spray_resp);
-		anchor = wga_lookup_or_create_anchor(net, sa_ip, sa_port,
-						     pi.sender_idx, pi.receiver_idx);
+		lookup_idx = pi.sender_idx;   /* our_idx */
 		break;
 	case WG_TYPE_DATA:
-		atomic_inc(&wga_stat_spray_data);
-		idx = pi.receiver_idx;
-		anchor = wga_lookup_anchor(net, sa_ip, sa_port, idx);
-		break;
 	case WG_TYPE_COOKIE:
-		idx = pi.receiver_idx;
-		anchor = wga_lookup_anchor(net, sa_ip, sa_port, idx);
+		lookup_idx = pi.receiver_idx; /* peer_idx */
 		break;
 	default:
+		atomic_inc(&wga_stat_spray_skip_type);
 		return XT_CONTINUE;
 	}
 
-	if (!anchor) {
-		atomic_inc(&wga_stat_spray_anchor_missing);
+	rcu_read_lock();
+	master = wga_find_master_rcu(net, lookup_idx);
+	if (!master) {
+		rcu_read_unlock();
+		atomic_inc(&wga_stat_spray_no_master);
 		return XT_CONTINUE;
 	}
 
-	did_rewrite = wga_pick_and_rewrite(skb, iph, udph, anchor);
-	if (did_rewrite)
+	if (wga_pick_and_rewrite(skb, iph, udph, master))
 		atomic_inc(&wga_stat_spray_rewrote);
 	else
 		atomic_inc(&wga_stat_spray_no_rewrite);
-	nf_ct_put(anchor);
+	rcu_read_unlock();
+
 	return XT_CONTINUE;
 }
 
-/* --------------------------------------------------------------------
- *   Target dispatcher
- * -------------------------------------------------------------------- */
-
-static unsigned int wganycast_target(struct sk_buff *skb,
-				     const struct xt_action_param *par)
-{
-	const struct xt_wganycast_info *info = par->targinfo;
-	struct net *net = par->state->net;
-
-	if (info->mode == XT_WGANYCAST_MODE_LEARN)
-		return wganycast_learn_v4(skb, net);
-	if (info->mode == XT_WGANYCAST_MODE_SPRAY)
-		return wganycast_spray_v4(skb, net);
-	return XT_CONTINUE;
-}
-
-static int wganycast_checkentry(const struct xt_tgchk_param *par)
-{
-	const struct xt_wganycast_info *info = par->targinfo;
-
-	if (info->mode != XT_WGANYCAST_MODE_LEARN &&
-	    info->mode != XT_WGANYCAST_MODE_SPRAY)
-		return -EINVAL;
-	return 0;
-}
-
-/* Target array exposed to xt_wg_main.c.  Helper registration is
- * driven by xt_wganycast_module_init / _exit, also called from
- * xt_wg_main.c.
+/* Argument-less target — `iptables -j WGANYCAST` takes no flags.
+ * targetsize = 0 means iptables passes no per-rule payload.
  */
 struct xt_target xt_wganycast_targets[] __read_mostly = {
 	{
 		.name		= "WGANYCAST",
 		.revision	= 0,
 		.family		= NFPROTO_IPV4,
-		.target		= wganycast_target,
-		.targetsize	= sizeof(struct xt_wganycast_info),
-		.checkentry	= wganycast_checkentry,
+		.target		= wganycast_target_v4,
+		.targetsize	= 0,
 		.me		= THIS_MODULE,
 	},
 };
@@ -667,8 +716,8 @@ int xt_wganycast_module_init(void)
 {
 	int rc;
 
-	wganycast_helper.me = THIS_MODULE;
-	rc = nf_conntrack_helper_register(&wganycast_helper);
+	wga_helper.me = THIS_MODULE;
+	rc = nf_conntrack_helper_register(&wga_helper);
 	if (rc)
 		return rc;
 
@@ -683,5 +732,5 @@ void xt_wganycast_module_exit(void)
 {
 	if (wga_stats_proc)
 		proc_remove(wga_stats_proc);
-	nf_conntrack_helper_unregister(&wganycast_helper);
+	nf_conntrack_helper_unregister(&wga_helper);
 }
