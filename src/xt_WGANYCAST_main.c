@@ -12,8 +12,10 @@
  *   - Two synthetic marker `nf_conntrack_expect` per master, both
  *     with `dst.protonum = WGA_MARKER_PROTO (253)` and
  *     `NF_CT_EXPECT_PERMANENT`.  Marker 1 keyed by `our_idx` in
- *     `src.u3.ip`; marker 2 keyed by `peer_idx`.  Both serve as
- *     an O(1) `idx → master` index via `__nf_ct_expect_find`.
+ *     `dst.u3.ip`; marker 2 keyed by `peer_idx`.  `dst.u3.ip` is
+ *     the kernel's `nf_ct_expect_dst_hash` input, so per-session
+ *     markers fan out across the 8192-bucket expect hashtable
+ *     (would be one-bucket pile-up if we keyed via `src.u3.ip`).
  *     They never match real packets — real WG is proto=UDP,
  *     marker is proto=253, and protonum is exact-compared with no
  *     mask in `__nf_ct_tuple_dst_cmp`.
@@ -324,37 +326,40 @@ static bool wga_parse_packet(struct sk_buff *skb,
  *
  *   Tuple shape:
  *     src.l3num    = AF_INET
- *     src.u3.ip    = idx          (mask 0xFFFFFFFF — exact match)
+ *     dst.u3.ip    = idx          (mask 0xFFFFFFFF — exact match,
+ *                                  AND the hash key — see below)
  *     dst.protonum = WGA_MARKER_PROTO (253)   (exact, no mask)
- *     all other fields = 0        (mask = 0 — wildcard)
+ *     all other fields = 0        (mask = 0xFF/0xFFFF — exact-zero)
+ *
+ *   The kernel's expectation hash (`nf_ct_expect_dst_hash`) keys on
+ *   `dst.u3.all` + `dst.protonum` + `dst.u.all` + `src.l3num`.  By
+ *   placing `idx` in `dst.u3.ip` instead of `src.u3.ip` (where it
+ *   sat through v9.0–v9.3), each marker spreads across the 8192-
+ *   bucket hash table — eliminating the same-bucket pile-up that
+ *   would otherwise force O(N) lookups across all sessions.
  *
  *   Real packets cannot match because they all have proto=UDP, and
  *   protonum is exact-compared with no mask in `__nf_ct_tuple_dst_cmp`.
- *   The kernel also hashes markers (proto=253) into different buckets
- *   from real UDP traffic, so it never even visually scans them.
  * -------------------------------------------------------------------- */
 
 static void wga_marker_tuple(struct nf_conntrack_tuple *t, __le32 idx)
 {
 	memset(t, 0, sizeof(*t));
 	t->src.l3num    = AF_INET;
-	t->src.u3.ip    = (__force __be32)idx;
+	t->dst.u3.ip    = (__force __be32)idx;
 	t->dst.protonum = WGA_MARKER_PROTO;
 }
 
 static int wga_register_marker(struct nf_conn *master, __le32 idx)
 {
 	struct nf_conntrack_expect *exp;
-	union nf_inet_addr saddr_idx;
+	union nf_inet_addr daddr_idx;
 	/* Kernel 7.0.3's nf_ct_expect_init dereferences daddr/src/dst
 	 * UNCONDITIONALLY (only saddr has a NULL check).  Passing NULL
 	 * for any of these → instant null-ptr panic.  Pass zero-valued
-	 * pointers so the deref reads from valid stack locations.  The
-	 * resulting tuple dst.u3 = 0 / src.port = 0 / dst.port = 0 are
-	 * all exact-matched (mask 0xFFFFFFFF / 0xFFFF), but real WG
-	 * packets always have non-zero values for these fields, so the
-	 * marker never matches real traffic. */
-	union nf_inet_addr daddr_zero = { };
+	 * pointers so the deref reads from valid stack locations.  saddr
+	 * stays NULL → mask.src.u3 = 0 (true wildcard), which doesn't
+	 * matter for matching but keeps the tuple semantically clean. */
 	__be16 port_zero = 0;
 	int rc;
 
@@ -362,13 +367,15 @@ static int wga_register_marker(struct nf_conn *master, __le32 idx)
 	if (!exp)
 		return -ENOMEM;
 
-	saddr_idx.ip = (__force __be32)idx;
+	daddr_idx.ip = (__force __be32)idx;
 	nf_ct_expect_init(exp, NF_CT_EXPECT_CLASS_DEFAULT, AF_INET,
-			  &saddr_idx,        /* src.ip = idx, mask 0xFFFFFFFF */
-			  &daddr_zero,       /* dst.ip = 0, mask 0xFFFFFFFF   */
+			  NULL,              /* src.ip wildcard (mask 0)      */
+			  &daddr_idx,        /* dst.ip = idx, mask 0xFFFFFFFF
+			                      * — primary key + hash input    */
 			  WGA_MARKER_PROTO,  /* sentinel — never real         */
 			  &port_zero,        /* src.port = 0, mask 0xFFFF     */
-			  &port_zero);       /* dst.port = 0, mask 0xFFFF     */
+			  &port_zero);       /* dst.port = 0, mask 0xFFFF
+			                      * — also contributes to hash    */
 	exp->flags  = NF_CT_EXPECT_PERMANENT;
 	exp->helper = NULL;  /* marker never matches a real packet */
 

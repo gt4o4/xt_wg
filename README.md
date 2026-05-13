@@ -159,10 +159,20 @@ never mistakes a real packet for one of our markers.
 
 ```c
 src.l3num    = AF_INET
-src.u3.ip    = idx_as_be32       /* our_idx OR peer_idx */
+dst.u3.ip    = idx_as_be32       /* our_idx OR peer_idx — primary key
+                                  * AND hash input (see below) */
 dst.protonum = WGA_MARKER_PROTO  /* 253 — RFC 3692 experimental */
 all other fields = 0             /* mask = 0xFFFFFFFF / 0xFFFF */
 ```
+
+The idx lives in `dst.u3.ip` rather than `src.u3.ip` because
+`nf_ct_expect_dst_hash` (the kernel's expectation hashtable hash
+function) keys on `dst.u3.all` + `dst.protonum` + `dst.u.all` +
+`src.l3num` — none of `src.u3` contributes.  Putting the per-
+session idx in `dst.u3.ip` spreads markers across the 8192-bucket
+expect hashtable; putting it in `src.u3.ip` would pile every
+marker into ONE bucket and degrade `__nf_ct_expect_find` to O(N)
+across all sessions.
 
 `max_expected = 8` is sized to span WG's transient session
 overlap.  During re-key both old and new sessions transmit DATA

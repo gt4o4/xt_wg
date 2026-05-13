@@ -26,8 +26,14 @@
  * master (the first ct that processes a WG RESP) plus two
  * "synthetic marker" expectations under it:
  *
- *   - marker_1.src.u3.ip = our_idx,  dst.protonum = WGA_MARKER_PROTO
- *   - marker_2.src.u3.ip = peer_idx, dst.protonum = WGA_MARKER_PROTO
+ *   - marker_1.dst.u3.ip = our_idx,  dst.protonum = WGA_MARKER_PROTO
+ *   - marker_2.dst.u3.ip = peer_idx, dst.protonum = WGA_MARKER_PROTO
+ *
+ * (idx goes in `dst.u3.ip` rather than `src.u3.ip` because the
+ *  kernel's expectation hashtable lookup keys on `dst.u3` + dst.port
+ *  + dst.protonum + src.l3num.  Putting per-session idx in dst spreads
+ *  markers across the 8192-bucket hashtable instead of piling every
+ *  marker into one bucket.)
  *
  * Both markers are PERMANENT and serve only as a `our_idx → master`
  * resp. `peer_idx → master` index (looked up via
