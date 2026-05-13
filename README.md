@@ -131,12 +131,15 @@ See [openwrt/package/README.md](/openwrt/package/README.md).
 ## WGANYCAST
 
 WG-protocol-aware dynamic anycast pool learning + per-packet UDP
-destination spray.  No rule-level arguments — the pool is built at
-runtime from observed inbound WG traffic, keyed by WG session
-indices.
+destination spray.  Pool is built at runtime from observed inbound
+WG traffic, keyed by WG session indices.  An **optional per-rule
+`--init-pool`** flag supplies a static cold-start fallback for
+hosts that originate WG sessions and have no inbound traffic to
+learn from on first packet.
 
-v9 (current) replaces v3.x's synthetic-anchor design with **real WG
-flow cts as masters** plus **synthetic-marker expectations** for
+v10 (current) adds the optional `--init-pool` to v9's design.  v9
+itself replaced v3.x's synthetic-anchor design with **real WG flow
+cts as masters** plus **synthetic-marker expectations** for
 indexing.  No private rhashtable, no manual `nf_conntrack_alloc`,
 no `dport=0` synthetic anchors polluting `/proc/net/nf_conntrack`.
 
@@ -147,7 +150,7 @@ no `dport=0` synthetic anchors polluting `/proc/net/nf_conntrack`.
 | `raw` PREROUTING (any prio) | `-p udp --dport <listenPort> -j CT --helper WGANYCAST` | Attach the WGANYCAST conntrack helper to peer-initiated WG cts. |
 | `raw` OUTPUT (any prio) | `-p udp --dport <listenPort> -j CT --helper WGANYCAST` | Attach to us-initiated WG cts.  **Both directions are mandatory** — CT --helper attaches the helper at ct CREATION via template copy, so the direction that creates the ct must match. |
 | conntrack-helper, prio +300 | helper's `.help` callback (`wga_help`) | On RESP (in/out): claim ct as per-session master (set `IPS_FIXED_TIMEOUT_BIT` + 200 s timeout, **REFRESHED on every promotion AND every inbound DATA**), register two marker expectations under it (one keyed by `our_idx`, one by `peer_idx`).  On inbound DATA/COOKIE: look up master via `our_idx` marker, refresh master TTL + pool's (saddr, sport) entry. |
-| `raw` OUTPUT, prio −300 | `-p udp --sport <listenPort> -j WGANYCAST` | Parse WG header for the idx visible in the outbound packet (sender_idx for INIT/RESP = our_idx; receiver_idx for DATA/COOKIE = peer_idx), look up master via the corresponding marker, pick a random pool entry, rewrite `iph->daddr` + `udph->dest` with incremental checksum updates.  No master / empty pool → `XT_CONTINUE` (packet goes to WG's configured `peer.endpoint` as-is). |
+| `raw` OUTPUT, prio −300 | `-p udp --sport <listenPort> -j WGANYCAST` *or* `-d <peer> --dport <port> -j WGANYCAST --init-pool …` | Parse WG header for the idx visible in the outbound packet (sender_idx for INIT/RESP = our_idx; receiver_idx for DATA/COOKIE = peer_idx).  **Master found** → pick from master's learned pool, rewrite `iph->daddr` + `udph->dest` with incremental checksum updates.  Also seed master's pool with rule's `--init-pool` entries via `wga_seed_pool_if_absent` (no refresh of existing slots → preserves seed-then-decay).  **Master NOT found + `--init-pool` non-empty** → cold-start fallback: pick a random init entry and rewrite (`spray_init_rewrote++`).  **Master NOT found + no init pool** → `XT_CONTINUE` (`spray_no_master++`). |
 
 ### Marker expectations
 
@@ -258,6 +261,9 @@ configuration needed.
 Gateway maps both anycast IPs' UDP/59263 → backend's WG :51821.
 WG's `listenPort = 51821` on both ends.
 
+**Receiver side** (the WG backend; pool grows naturally from
+inbound traffic):
+
 ```shell
 # Attach helper to inbound WG cts (peer-initiated sessions).
 iptables -t raw -A PREROUTING -p udp --dport 51821 \
@@ -267,14 +273,49 @@ iptables -t raw -A PREROUTING -p udp --dport 51821 \
 iptables -t raw -A OUTPUT     -p udp --dport 51821 \
   -j CT --helper WGANYCAST
 
-# Spray outbound across learned doors.
+# Spray outbound across learned doors (catch-all, no init pool).
 iptables -t raw -A OUTPUT     -p udp --sport 51821 -j WGANYCAST
 ```
 
+**Initiator side** (CN hub originating WG to the backend; needs
+cold-start init pool because nothing inbound has been observed
+yet):
+
+```shell
+# Same two helper-attach rules as above.
+iptables -t raw -A PREROUTING -p udp --dport 51821 \
+  -j CT --helper WGANYCAST
+iptables -t raw -A OUTPUT     -p udp --dport 51821 \
+  -j CT --helper WGANYCAST
+
+# Per-peer SPRAY rule with cold-start init pool of CF Spectrum
+# anycast IPs paired with the app's edgePort.  No catch-all —
+# the per-peer rule's -d filter is mutually exclusive.
+iptables -t raw -A OUTPUT     \
+  -d 193.134.211.67 -p udp --dport 51821 \
+  -j WGANYCAST \
+  --init-pool 138.252.162.176:59263,161.248.136.186:59263
+```
+
+Until the first inbound RESP arrives, outbound WG packets get
+rewritten to a random init-pool entry (`spray_init_rewrote++`).
+Once the helper sees a RESP and promotes a master, the SPRAY path
+seeds the init entries into master's pool via
+`wga_seed_pool_if_absent` (no refresh of existing slots, so the
+seed-then-decay property holds), and steady-state spray is from
+master's pool (`spray_rewrote++`).  Real-observed doors that
+match init entries (saddr == init.ip, sport == edgePort —
+typical for CF Spectrum) get LRU-promoted on subsequent inbound
+RX; unmatched init entries age out as the pool fills with real
+doors.
+
 Port-translation by the gateway (e.g. anycast:59263 →
-backend:51821 in CF Spectrum) is learned implicitly because
-`wga_help` captures the observed source `(ip, port)` into the
-inline pool on every inbound DATA.
+backend:51821 in CF Spectrum) is learned implicitly on the
+receiver side because `wga_help` captures the observed source
+`(ip, port)` into the inline pool on every inbound DATA.  On the
+initiator side, the rule's `--init-pool` carries the same
+`(anycast_ip, edgePort)` tuples explicitly so the cold-start
+path knows where to spray before any inbound traffic exists.
 
 ### Diagnostics
 
@@ -294,6 +335,8 @@ sudo cat /proc/net/nf_conntrack_expect
 # Live counters.  Health signature on a working host:
 #   spray_rewrote / spray_total      → ~0.9       (most outbound rewritten)
 #   spray_no_master / spray_total    → < 0.1      (cold-start + short transients)
+#   spray_init_rewrote / spray_total → < 0.01     (init-pool fallback rare after handshake)
+#   spray_init_seed / spray_total    → varies     (every spray_rewrote on init-pool rules)
 #   pool_match_refresh / inbound DATA→ 0.7-0.9    (steady-state pool hot)
 #   master_promote_lost              → near 0     (race losses rare)
 #   marker_register_fail             → 0          (max_expected sized right)
@@ -327,9 +370,11 @@ order:
   packet of the same 5-tuple inherits the *first* random pick.
   WGANYCAST picks per-packet, with per-session pool isolation.
 - **Pre-v3 `--dest` / `--canonical` and v3.x `--learn` /
-  `--spray` are gone**.  The bare `WGANYCAST` target takes no
-  arguments — its behaviour depends only on chain (PREROUTING vs
-  OUTPUT).
+  `--spray` are gone**.  v10's only flag is the optional
+  `--init-pool <ip>[:<port>][,<ip>[:<port>]]...` (also accepted
+  in repeat-flag form as `--init-dest <ip>[:<port>]`, max 4
+  entries combined).  Omitting the flag preserves receiver-side
+  behaviour (pool grows from inbound RX only).
 - **IPv4 only.**  Same constraint as WGPTCP; IPv6 support would
   need parallel paths in the marker tuple builders.
 

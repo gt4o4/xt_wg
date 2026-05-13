@@ -2,7 +2,8 @@
 /*
  * Author: Bingchen Gong <gongbingchen@gmail.com>
  *
- * xt_WGANYCAST v9 — marker-only expectation, no synthetic conntracks.
+ * xt_WGANYCAST v10 — marker-only expectation, no synthetic conntracks,
+ * with optional per-rule `--init-pool` cold-start seeding.
  *
  *   - Per-session **master** is the first WG ct that processes a
  *     RESP message.  Pool storage lives inline in the master's
@@ -30,7 +31,15 @@
  *   - SPRAY xt target (raw OUTPUT, -300) parses WG header for the
  *     session idx in the outbound packet and looks up the marker
  *     to find master → snapshots pool → rewrites iph->daddr +
- *     udph->dest with the chosen anycast door.
+ *     udph->dest with the chosen anycast door.  If no master
+ *     exists yet AND the rule carries a non-empty `--init-pool`,
+ *     the target picks from the static init pool instead (cold-
+ *     start fallback for CN hubs whose outbound INIT would
+ *     otherwise hit a GFW-blocked real IP).  When master DOES
+ *     exist, the init entries are also seeded into master's
+ *     inline pool via the normal `wga_learn_door` LRU path —
+ *     idempotent, so re-running per packet is safe and self-
+ *     converges.
  *
  * Master ct lifetime: bounded above by 200 s via
  * `IPS_FIXED_TIMEOUT_BIT`.  Markers + pool die with master via
@@ -90,6 +99,8 @@ static atomic_t wga_stat_spray_skip_type      = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_no_master      = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_rewrote        = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_no_rewrite     = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_init_rewrote   = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_init_seed      = ATOMIC_INIT(0);
 
 static int wga_stats_show(struct seq_file *s, void *v)
 {
@@ -113,6 +124,8 @@ static int wga_stats_show(struct seq_file *s, void *v)
 	seq_printf(s, "spray_no_master       %d\n", atomic_read(&wga_stat_spray_no_master));
 	seq_printf(s, "spray_rewrote         %d\n", atomic_read(&wga_stat_spray_rewrote));
 	seq_printf(s, "spray_no_rewrite      %d\n", atomic_read(&wga_stat_spray_no_rewrite));
+	seq_printf(s, "spray_init_rewrote    %d\n", atomic_read(&wga_stat_spray_init_rewrote));
+	seq_printf(s, "spray_init_seed       %d\n", atomic_read(&wga_stat_spray_init_seed));
 	return 0;
 }
 
@@ -462,7 +475,95 @@ static void wga_learn_door(struct nf_conn *master,
 }
 
 /* --------------------------------------------------------------------
- *   Pick from pool + rewrite outbound packet
+ *   Seed-only pool insert — fills an empty slot if (ip, port) isn't
+ *   present, else does nothing.
+ *
+ *   Unlike `wga_learn_door`, this does NOT refresh `last_seen_q8` on
+ *   match and does NOT evict on full pool.  The "no refresh" semantic
+ *   is critical for seed-then-decay: if init entries got refreshed on
+ *   every outbound packet, they'd always be the youngest and would
+ *   never be LRU-evicted by real-observed doors.  By leaving
+ *   `last_seen_q8` alone, the init entry ages naturally; if a real
+ *   inbound RX confirms the same (ip, port), `wga_learn_door` (called
+ *   from `wga_help`) WILL refresh it, promoting it from "init seed"
+ *   to "confirmed door".  Entries that never see real RX confirmation
+ *   age out, and once the pool is full of real-observed doors, real
+ *   eviction kicks in via `wga_learn_door`'s normal LRU path.
+ * -------------------------------------------------------------------- */
+
+static void wga_seed_pool_if_absent(struct nf_conn *master,
+				    __be32 anycast_ip, __be16 anycast_port)
+{
+	struct wga_pool_inline *p = wga_pool_of(master);
+	int i, free_idx = -1;
+
+	if (!p)
+		return;
+
+	spin_lock_bh(&master->lock);
+
+	for (i = 0; i < WGA_POOL_SIZE; i++) {
+		struct wga_pool_entry *e = &p->slot[i];
+
+		if (e->ip == 0) {
+			if (free_idx < 0)
+				free_idx = i;
+			continue;
+		}
+		if (e->ip == anycast_ip && e->port == anycast_port) {
+			/* Already present — do NOT refresh. */
+			spin_unlock_bh(&master->lock);
+			return;
+		}
+	}
+
+	if (free_idx >= 0) {
+		p->slot[free_idx].ip            = anycast_ip;
+		p->slot[free_idx].port          = anycast_port;
+		p->slot[free_idx].last_seen_q8  = wga_now_q8();
+		atomic_inc(&wga_stat_pool_insert_append);
+	}
+	/* Pool full and entry not present — silently drop the seed.
+	 * Real-observed doors take precedence; LRU eviction stays the
+	 * exclusive privilege of `wga_learn_door`. */
+
+	spin_unlock_bh(&master->lock);
+}
+
+/* --------------------------------------------------------------------
+ *   Rewrite outbound packet daddr (+ dport when non-zero)
+ *
+ *   Primitive used by both the dynamic-pool and init-pool spray
+ *   paths.  Idempotent for (old == new): returns true regardless
+ *   of whether a rewrite was actually emitted, so callers can use
+ *   the return to mean "spray decision was made", not "csum was
+ *   touched".
+ * -------------------------------------------------------------------- */
+
+static void wga_rewrite_packet(struct sk_buff *skb,
+			       struct iphdr *iph, struct udphdr *udph,
+			       __be32 new_addr, __be16 new_port)
+{
+	__be32 old_addr = iph->daddr;
+	__be16 old_port = udph->dest;
+
+	if (new_addr != old_addr) {
+		iph->daddr = new_addr;
+		csum_replace4(&iph->check, old_addr, new_addr);
+		if (udph->check)
+			inet_proto_csum_replace4(&udph->check, skb,
+						 old_addr, new_addr, true);
+	}
+	if (new_port && new_port != old_port) {
+		udph->dest = new_port;
+		if (udph->check)
+			inet_proto_csum_replace2(&udph->check, skb,
+						 old_port, new_port, false);
+	}
+}
+
+/* --------------------------------------------------------------------
+ *   Pick from master's pool + rewrite outbound packet
  *
  *   Snapshot the live entries under master's lock, then do the
  *   random pick + checksum rewrite unlocked.  Short critical section.
@@ -475,8 +576,6 @@ static bool wga_pick_and_rewrite(struct sk_buff *skb,
 	struct wga_pool_inline *p = wga_pool_of(master);
 	struct wga_pool_entry candidates[WGA_POOL_SIZE];
 	int i, n = 0;
-	__be32 old_addr, new_addr;
-	__be16 old_port, new_port;
 	u32 pick;
 
 	if (!p)
@@ -492,26 +591,73 @@ static bool wga_pick_and_rewrite(struct sk_buff *skb,
 	if (n == 0)
 		return false;
 
-	pick     = get_random_u32_below((u32)n);
-	new_addr = candidates[pick].ip;
-	new_port = candidates[pick].port;
-	old_addr = iph->daddr;
-	old_port = udph->dest;
-
-	if (new_addr != old_addr) {
-		iph->daddr = new_addr;
-		csum_replace4(&iph->check, old_addr, new_addr);
-		if (udph->check)
-			inet_proto_csum_replace4(&udph->check, skb,
-						 old_addr, new_addr, true);
-	}
-	if (new_port && new_port != old_port) {
-		udph->dest = new_port;
-		if (udph->check)
-			inet_proto_csum_replace2(&udph->check, skb,
-						 old_port, new_port, false);
-	}
+	pick = get_random_u32_below((u32)n);
+	wga_rewrite_packet(skb, iph, udph,
+			   candidates[pick].ip, candidates[pick].port);
 	return true;
+}
+
+/* --------------------------------------------------------------------
+ *   Pick from rule-side init pool + rewrite outbound packet
+ *
+ *   Used in two situations:
+ *     1) No master ct exists yet (cold start) — pure fallback.
+ *     2) Reserved for callers that want to ignore master state;
+ *        currently only (1).
+ *
+ *   Stateless: reads `info->init[]` (immutable rule blob),
+ *   writes only to the packet.  No conntrack interaction.
+ * -------------------------------------------------------------------- */
+
+static bool wga_pick_init_and_rewrite(struct sk_buff *skb,
+				      struct iphdr *iph, struct udphdr *udph,
+				      const struct xt_wganycast_info *info)
+{
+	u32 pick;
+
+	if (!info || info->ninit == 0)
+		return false;
+
+	pick = get_random_u32_below((u32)info->ninit);
+	wga_rewrite_packet(skb, iph, udph,
+			   info->init[pick].ip, info->init[pick].port);
+	return true;
+}
+
+/* --------------------------------------------------------------------
+ *   Seed master's inline pool from the rule's static init entries.
+ *
+ *   Called on every outbound packet that finds a master ct AND has
+ *   a non-empty init pool on the rule.  Uses `wga_seed_pool_if_absent`
+ *   (NOT `wga_learn_door`) so:
+ *     - first call after master promotion fills empty slots with init
+ *       entries that have a current `last_seen_q8`,
+ *     - subsequent calls find init entries already present and exit
+ *       early without touching `last_seen_q8`,
+ *     - init entries thus age naturally over time; real-observed RX
+ *       (via `wga_help` → `wga_learn_door`) can either refresh them
+ *       (if real saddr/sport == init.ip/init.port — promotes to
+ *       confirmed) or evict them via LRU (once 4 distinct real doors
+ *       exist, oldest init entry loses).
+ *
+ *   Bounded loop (max 4 calls per packet) under master->lock per
+ *   call.  Negligible cost.  After init entries occupy free slots,
+ *   subsequent loops are O(ninit) lock-acquire + early-return.
+ * -------------------------------------------------------------------- */
+
+static void wga_seed_master_from_init(struct nf_conn *master,
+				      const struct xt_wganycast_info *info)
+{
+	u8 i;
+
+	if (!info || info->ninit == 0)
+		return;
+
+	for (i = 0; i < info->ninit; i++)
+		wga_seed_pool_if_absent(master,
+					info->init[i].ip,
+					info->init[i].port);
+	atomic_inc(&wga_stat_spray_init_seed);
 }
 
 /* --------------------------------------------------------------------
@@ -685,12 +831,20 @@ static int wga_help(struct sk_buff *skb, unsigned int protoff,
  *
  *   The two markers (our_idx-keyed and peer_idx-keyed) under each
  *   master mean either lookup type resolves to the same master.
+ *
+ *   v10: per-rule `info->init[]` static pool steers two paths:
+ *     - master found + ninit > 0: seed master's pool with init
+ *       entries (idempotent LRU insert), then pick from master.
+ *     - master NOT found + ninit > 0: cold-start fallback —
+ *       pick from init pool directly (no conntrack state touched).
+ *     - master NOT found + ninit == 0: v9 behaviour, spray_no_master.
  * -------------------------------------------------------------------- */
 
 static unsigned int wganycast_target_v4(struct sk_buff *skb,
 					const struct xt_action_param *par)
 {
 	struct net *net = xt_net(par);
+	const struct xt_wganycast_info *info = par->targinfo;
 	struct wga_pkt_info pi;
 	struct iphdr *iph;
 	struct udphdr *udph;
@@ -722,9 +876,22 @@ static unsigned int wganycast_target_v4(struct sk_buff *skb,
 	master = wga_find_master_rcu(net, lookup_idx);
 	if (!master) {
 		rcu_read_unlock();
-		atomic_inc(&wga_stat_spray_no_master);
+		/* Cold start — no marker yet.  If the rule carries a
+		 * static init pool, spray from it; otherwise count
+		 * spray_no_master and pass through. */
+		if (wga_pick_init_and_rewrite(skb, iph, udph, info))
+			atomic_inc(&wga_stat_spray_init_rewrote);
+		else
+			atomic_inc(&wga_stat_spray_no_master);
 		return XT_CONTINUE;
 	}
+
+	/* Master exists.  Seed master's inline pool from rule's init
+	 * entries (idempotent LRU insert; harmless re-runs on every
+	 * packet).  Then pick from master's pool — which now contains
+	 * any real-observed doors PLUS init entries until LRU decays
+	 * them. */
+	wga_seed_master_from_init(master, info);
 
 	if (wga_pick_and_rewrite(skb, iph, udph, master))
 		atomic_inc(&wga_stat_spray_rewrote);
@@ -735,16 +902,17 @@ static unsigned int wganycast_target_v4(struct sk_buff *skb,
 	return XT_CONTINUE;
 }
 
-/* Argument-less target — `iptables -j WGANYCAST` takes no flags.
- * targetsize = 0 means iptables passes no per-rule payload.
+/* Per-rule payload `struct xt_wganycast_info` carries optional
+ * `--init-pool` entries.  targetsize > 0 is mandatory in revision
+ * 1 — v9's argument-less revision 0 was retired.
  */
 struct xt_target xt_wganycast_targets[] __read_mostly = {
 	{
 		.name		= "WGANYCAST",
-		.revision	= 0,
+		.revision	= 1,
 		.family		= NFPROTO_IPV4,
 		.target		= wganycast_target_v4,
-		.targetsize	= 0,
+		.targetsize	= sizeof(struct xt_wganycast_info),
 		.me		= THIS_MODULE,
 	},
 };
