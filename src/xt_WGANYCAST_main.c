@@ -2,8 +2,9 @@
 /*
  * Author: Bingchen Gong <gongbingchen@gmail.com>
  *
- * xt_WGANYCAST v10 — marker-only expectation, no synthetic conntracks,
- * with optional per-rule `--init-pool` cold-start seeding.
+ * xt_WGANYCAST v10.1 — marker-only expectation, no synthetic conntracks,
+ * with optional per-rule `--init-pool` cold-start seeding and per-door
+ * conntrack-based dead-door eviction (no module-private storage).
  *
  *   - Per-session **master** is the first WG ct that processes a
  *     RESP message.  Pool storage lives inline in the master's
@@ -31,17 +32,34 @@
  *   - SPRAY xt target (raw OUTPUT, -300) parses WG header for the
  *     session idx in the outbound packet and looks up the marker
  *     to find master → snapshots pool → rewrites iph->daddr +
- *     udph->dest with the chosen anycast door.  If no master
- *     exists yet AND the rule carries a non-empty `--init-pool`,
- *     the target picks from the static init pool instead (cold-
- *     start fallback for CN hubs whose outbound INIT would
- *     otherwise hit a GFW-blocked real IP).  When master DOES
- *     exist, the init entries are also seeded into master's
- *     inline pool via `wga_seed_pool_if_absent` (insert-only,
- *     never refreshes `last_seen_q8` on match — preserves
- *     seed-then-decay so real-observed RX from `wga_help` can
- *     LRU-evict unconfirmed init entries once 4 distinct real
- *     doors exist).
+ *     udph->dest with the chosen anycast door.
+ *
+ *     v10.0: when master exists, init entries unconditionally seeded
+ *     into master's inline pool on every packet via
+ *     `wga_seed_pool_if_absent` (insert-only, no refresh).
+ *
+ *     v10.1: pipeline is now
+ *       (a) pre-spray GC via `wga_run_pool_gc` — drops slots whose
+ *           per-door conntrack has expired,
+ *       (b) gated seeding via `wga_should_seed` — only on outbound
+ *           handshake / keepalive / fresh-master,
+ *       (c) DATA spray uses `wga_pick_for_data_and_rewrite` which
+ *           filters slots by `wga_query_door`: an entry is eligible
+ *           only if its per-door ct has `IPS_SEEN_REPLY_BIT` set OR
+ *           was matched in reply direction (RX-confirmed).  Handshake
+ *           spray uses the original full-pool random pick (probes are
+ *           supposed to try unknowns).
+ *
+ *     If no master exists AND the rule has a non-empty `--init-pool`,
+ *     spray from the static init pool, biased toward entries whose
+ *     per-door ct is WGA_DOOR_ALIVE (so re-key INITs prefer the same
+ *     anycast as the prior session, keeping the new INIT on the same
+ *     conntrack and the same master).
+ *
+ *     `last_seen_q8 == 0` is now the "untried init seed" sentinel.
+ *     `wga_seed_pool_if_absent` writes 0; spray paths promote the
+ *     slot to `last_seen_q8 = wga_now_q8()` once they decide to use
+ *     it (so subsequent DATA-spray must verify via per-door ct).
  *
  * Master ct lifetime: bounded above by 200 s via
  * `IPS_FIXED_TIMEOUT_BIT`.  Markers + pool die with master via
@@ -103,6 +121,12 @@ static atomic_t wga_stat_spray_rewrote        = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_no_rewrite     = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_init_rewrote   = ATOMIC_INIT(0);
 static atomic_t wga_stat_spray_init_seed      = ATOMIC_INIT(0);
+static atomic_t wga_stat_pool_gc_removed      = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_data_filtered  = ATOMIC_INIT(0);
+static atomic_t wga_stat_spray_data_fallback  = ATOMIC_INIT(0);
+static atomic_t wga_stat_pool_seed_promoted   = ATOMIC_INIT(0);
+static atomic_t wga_stat_init_bias_alive      = ATOMIC_INIT(0);
+static atomic_t wga_stat_init_bias_fallback   = ATOMIC_INIT(0);
 
 static int wga_stats_show(struct seq_file *s, void *v)
 {
@@ -128,6 +152,12 @@ static int wga_stats_show(struct seq_file *s, void *v)
 	seq_printf(s, "spray_no_rewrite      %d\n", atomic_read(&wga_stat_spray_no_rewrite));
 	seq_printf(s, "spray_init_rewrote    %d\n", atomic_read(&wga_stat_spray_init_rewrote));
 	seq_printf(s, "spray_init_seed       %d\n", atomic_read(&wga_stat_spray_init_seed));
+	seq_printf(s, "pool_gc_removed       %d\n", atomic_read(&wga_stat_pool_gc_removed));
+	seq_printf(s, "spray_data_filtered   %d\n", atomic_read(&wga_stat_spray_data_filtered));
+	seq_printf(s, "spray_data_fallback   %d\n", atomic_read(&wga_stat_spray_data_fallback));
+	seq_printf(s, "pool_seed_promoted    %d\n", atomic_read(&wga_stat_pool_seed_promoted));
+	seq_printf(s, "init_bias_alive       %d\n", atomic_read(&wga_stat_init_bias_alive));
+	seq_printf(s, "init_bias_fallback    %d\n", atomic_read(&wga_stat_init_bias_fallback));
 	return 0;
 }
 
@@ -268,7 +298,19 @@ struct wga_pkt_info {
 	u8	wg_type;
 	__le32	sender_idx;	/* valid for INIT, RESP */
 	__le32	receiver_idx;	/* valid for RESP, COOKIE, DATA */
+	__u16	wg_payload_len;	/* WG payload size (after UDP hdr).
+				 * Used to detect WG keepalives (32 B
+				 * DATA = 4 type + 4 receiver_idx + 8
+				 * counter + 16 AEAD tag, no plaintext). */
 };
+
+/* WG keepalive: DATA message with empty plaintext.
+ *   wire layout = 4B header + 4B receiver_idx + 8B counter
+ *               + 0B encrypted plaintext + 16B AEAD tag
+ *   total      = 32 B
+ * Real DATA carrying any payload is larger; handshakes are larger;
+ * therefore exact == 32 reliably identifies keepalives. */
+#define WGA_KEEPALIVE_WG_PAYLOAD_LEN	32u
 
 static bool wga_parse_packet(struct sk_buff *skb,
 			     struct wga_pkt_info *info,
@@ -334,7 +376,8 @@ static bool wga_parse_packet(struct sk_buff *skb,
 		return false;
 	}
 
-	info->wg_type = wg_type;
+	info->wg_type        = wg_type;
+	info->wg_payload_len = (__u16)payload_len;
 	*iph_out  = iph;
 	*udph_out = udph;
 	return true;
@@ -481,16 +524,20 @@ static void wga_learn_door(struct nf_conn *master,
  *   present, else does nothing.
  *
  *   Unlike `wga_learn_door`, this does NOT refresh `last_seen_q8` on
- *   match and does NOT evict on full pool.  The "no refresh" semantic
- *   is critical for seed-then-decay: if init entries got refreshed on
- *   every outbound packet, they'd always be the youngest and would
- *   never be LRU-evicted by real-observed doors.  By leaving
- *   `last_seen_q8` alone, the init entry ages naturally; if a real
- *   inbound RX confirms the same (ip, port), `wga_learn_door` (called
- *   from `wga_help`) WILL refresh it, promoting it from "init seed"
- *   to "confirmed door".  Entries that never see real RX confirmation
- *   age out, and once the pool is full of real-observed doors, real
- *   eviction kicks in via `wga_learn_door`'s normal LRU path.
+ *   match and does NOT evict on full pool.  Newly-inserted slots are
+ *   stamped with `last_seen_q8 = 0` — the "untried init seed" sentinel
+ *   in v10.1's state machine.  Spray paths interpret `last_seen_q8 == 0`
+ *   as "this is an init seed; the kernel hasn't observed any per-door
+ *   conntrack activity on it yet — DATA-spray treats it as eligible
+ *   on first attempt, then bumps to a non-zero stamp afterwards so
+ *   subsequent DATA picks must verify via per-door ct + IPS_SEEN_REPLY_BIT".
+ *
+ *   The seed inserts only into FREE slots; full pools silently drop
+ *   seed attempts.  Real-observed doors (via `wga_help → wga_learn_door`)
+ *   own LRU eviction; init seeds never displace observed entries.  If a
+ *   real RX confirms the same (ip, port) as an existing init seed,
+ *   `wga_learn_door` refreshes it (sets `last_seen_q8` to current time),
+ *   promoting it from "init seed" to "RX-confirmed door".
  * -------------------------------------------------------------------- */
 
 static void wga_seed_pool_if_absent(struct nf_conn *master,
@@ -522,7 +569,10 @@ static void wga_seed_pool_if_absent(struct nf_conn *master,
 	if (free_idx >= 0) {
 		p->slot[free_idx].ip            = anycast_ip;
 		p->slot[free_idx].port          = anycast_port;
-		p->slot[free_idx].last_seen_q8  = wga_now_q8();
+		/* v10.1 sentinel: untried init seed.  Spray paths read 0
+		 * as "kernel-ct unverified yet; eligible by default and
+		 * promote-on-spray". */
+		p->slot[free_idx].last_seen_q8  = 0;
 		atomic_inc(&wga_stat_pool_insert_append);
 	}
 	/* Pool full and entry not present — silently drop the seed.
@@ -530,6 +580,73 @@ static void wga_seed_pool_if_absent(struct nf_conn *master,
 	 * exclusive privilege of `wga_learn_door`. */
 
 	spin_unlock_bh(&master->lock);
+}
+
+/* --------------------------------------------------------------------
+ *   Per-door conntrack queries — kernel-managed liveness signal
+ *
+ *   The kernel automatically creates a `nf_conn` for each unique
+ *   outbound 5-tuple `(our_saddr:our_sport, anycast_ip:edgePort, UDP)`
+ *   as we spray.  Reply traffic flips `IPS_SEEN_REPLY_BIT` on that ct.
+ *   We never write to these cts; we only read their state to drive
+ *   spray-eligibility decisions.  This is the entire mechanism for
+ *   v10.1's "dead door eviction" — no module-private liveness cache
+ *   needed.
+ * -------------------------------------------------------------------- */
+
+static void wga_build_door_tuple(struct nf_conntrack_tuple *t,
+				 __be32 saddr, __be16 sport,
+				 __be32 daddr, __be16 dport)
+{
+	memset(t, 0, sizeof(*t));
+	t->src.l3num      = AF_INET;
+	t->src.u3.ip      = saddr;
+	t->src.u.udp.port = sport;
+	t->dst.u3.ip      = daddr;
+	t->dst.u.udp.port = dport;
+	t->dst.protonum   = IPPROTO_UDP;
+}
+
+/* Tri-state liveness query.  Returns WGA_DOOR_*:
+ *   ALIVE   — ct exists AND (IPS_SEEN_REPLY_BIT set OR matched via
+ *             reply direction, i.e. inbound-initiated flow).
+ *   DEAD    — ct exists in original direction, no reply seen yet.
+ *   UNKNOWN — no ct found (never tried, or ct already expired).
+ *
+ * Caller decides how to treat UNKNOWN.  DATA-spray treats it as
+ * eligible (give the door a chance); pre-spray GC treats it as
+ * stale-when-slot-was-tried (gate by `last_seen_q8 > 0`).
+ */
+enum wga_door_state {
+	WGA_DOOR_UNKNOWN = 0,
+	WGA_DOOR_DEAD    = 1,
+	WGA_DOOR_ALIVE   = 2,
+};
+
+static enum wga_door_state
+wga_query_door(struct net *net,
+	       __be32 saddr, __be16 sport,
+	       __be32 daddr, __be16 dport)
+{
+	struct nf_conntrack_tuple t;
+	struct nf_conntrack_tuple_hash *h;
+	struct nf_conn *ct;
+	enum wga_door_state state;
+
+	wga_build_door_tuple(&t, saddr, sport, daddr, dport);
+	h = nf_conntrack_find_get(net, &nf_ct_zone_dflt, &t);
+	if (!h)
+		return WGA_DOOR_UNKNOWN;
+
+	ct = nf_ct_tuplehash_to_ctrack(h);
+	if (test_bit(IPS_SEEN_REPLY_BIT, &ct->status))
+		state = WGA_DOOR_ALIVE;
+	else if (NF_CT_DIRECTION(h) == IP_CT_DIR_REPLY)
+		state = WGA_DOOR_ALIVE;	/* inbound-initiated — RX-confirmed */
+	else
+		state = WGA_DOOR_DEAD;
+	nf_ct_put(ct);
+	return state;
 }
 
 /* --------------------------------------------------------------------
@@ -602,27 +719,66 @@ static bool wga_pick_and_rewrite(struct sk_buff *skb,
 /* --------------------------------------------------------------------
  *   Pick from rule-side init pool + rewrite outbound packet
  *
- *   Used in two situations:
- *     1) No master ct exists yet (cold start) — pure fallback.
- *     2) Reserved for callers that want to ignore master state;
- *        currently only (1).
+ *   Cold-start path: no master ct exists for this WG session yet.
+ *   Used by:
+ *     1) Initial INIT spray before any RESP has been observed.
+ *     2) Re-key INIT spray (new sender_idx → no marker → master NULL)
+ *        before the new RESP arrives.
  *
- *   Stateless: reads `info->init[]` (immutable rule blob),
- *   writes only to the packet.  No conntrack interaction.
+ *   v10.1 bias: query per-door cts of each `info->init[]` entry.
+ *   Entries whose per-door ct is WGA_DOOR_ALIVE (kernel observed a
+ *   reply on `(our:sport → entry.ip:entry.port)` recently) form the
+ *   "alive subset" — pick uniformly from it.  Fall back to uniform
+ *   pick across the full init pool only when no entry has alive
+ *   ct evidence (true cold-start, or every CF anycast unreachable).
+ *
+ *   Why this matters: on re-key, biasing toward the same anycast IP
+ *   as the prior session keeps the new INIT on the same per-door ct,
+ *   which means same conntrack → same master → markers added under
+ *   the SAME master.  Pool preserved across re-key, no migration
+ *   needed.  When the bias hits an anycast different from the prior
+ *   one (rare), the new master gets caught up via `wga_should_seed`'s
+ *   fresh-master trigger on the first post-promotion outbound.
+ *
+ *   Stateless from our side: reads `info->init[]` (immutable rule
+ *   blob), queries kernel ct hashtable, writes only to the packet.
+ *   No master/help state.
  * -------------------------------------------------------------------- */
 
 static bool wga_pick_init_and_rewrite(struct sk_buff *skb,
 				      struct iphdr *iph, struct udphdr *udph,
-				      const struct xt_wganycast_info *info)
+				      const struct xt_wganycast_info *info,
+				      struct net *net)
 {
+	u8 alive_idx[XT_WGANYCAST_INIT_MAX];
+	u8 alive_n = 0;
+	u8 i, chosen;
 	u32 pick;
 
 	if (!info || info->ninit == 0)
 		return false;
 
-	pick = get_random_u32_below((u32)info->ninit);
+	/* Pass 1: collect entries whose per-door ct is alive. */
+	for (i = 0; i < info->ninit; i++) {
+		if (wga_query_door(net, iph->saddr, udph->source,
+				   info->init[i].ip, info->init[i].port)
+		    == WGA_DOOR_ALIVE) {
+			alive_idx[alive_n++] = i;
+		}
+	}
+
+	if (alive_n > 0) {
+		pick = get_random_u32_below((u32)alive_n);
+		chosen = alive_idx[pick];
+		atomic_inc(&wga_stat_init_bias_alive);
+	} else {
+		pick = get_random_u32_below((u32)info->ninit);
+		chosen = (u8)pick;
+		atomic_inc(&wga_stat_init_bias_fallback);
+	}
+
 	wga_rewrite_packet(skb, iph, udph,
-			   info->init[pick].ip, info->init[pick].port);
+			   info->init[chosen].ip, info->init[chosen].port);
 	return true;
 }
 
@@ -660,6 +816,231 @@ static void wga_seed_master_from_init(struct nf_conn *master,
 					info->init[i].ip,
 					info->init[i].port);
 	atomic_inc(&wga_stat_spray_init_seed);
+}
+
+/* --------------------------------------------------------------------
+ *   v10.1 — pre-spray GC, seeding gates, DATA-filter spray
+ *
+ *   Pre-spray GC scans master's pool and removes slots whose per-door
+ *   ct has expired (state = WGA_DOOR_UNKNOWN) but were previously tried
+ *   (last_seen_q8 > 0).  Untried init seeds (last_seen_q8 == 0) are
+ *   kept regardless — they haven't had a chance yet.
+ *
+ *   Seeding gates: handshake (INIT/RESP/COOKIE) and WG keepalives
+ *   re-run `wga_seed_master_from_init`, plus a one-shot trigger on
+ *   freshly-promoted masters (occupied < pool size, no init-seed
+ *   sentinel present yet → re-seed).  This replaces v10.0's
+ *   unconditional per-packet seed call.
+ *
+ *   DATA spray uses a per-door-ct eligibility filter.  Handshakes use
+ *   the original full-pool random pick (they're meant to probe).
+ * -------------------------------------------------------------------- */
+
+/* Pre-spray pool GC.  Called per outbound packet immediately after
+ * master is found.  Two-pass: snapshot under lock, query cts unlocked,
+ * write back stale-slots-zeroed under lock (with reuse-detection so
+ * we don't clobber concurrent wga_help inserts). */
+static void wga_run_pool_gc(struct net *net, struct nf_conn *master,
+			    struct iphdr *iph, struct udphdr *udph)
+{
+	struct wga_pool_inline *p = wga_pool_of(master);
+	struct wga_pool_entry snapshot[WGA_POOL_SIZE];
+	bool stale[WGA_POOL_SIZE] = { 0 };
+	int i;
+	bool any_stale = false;
+
+	if (!p)
+		return;
+
+	spin_lock_bh(&master->lock);
+	memcpy(snapshot, p->slot, sizeof(snapshot));
+	spin_unlock_bh(&master->lock);
+
+	for (i = 0; i < WGA_POOL_SIZE; i++) {
+		enum wga_door_state s;
+
+		if (snapshot[i].ip == 0)
+			continue;
+		if (snapshot[i].last_seen_q8 == 0)
+			continue;	/* untried init seed — keep */
+
+		s = wga_query_door(net, iph->saddr, udph->source,
+				   snapshot[i].ip, snapshot[i].port);
+		if (s == WGA_DOOR_UNKNOWN) {
+			/* Slot was tried (last_seen > 0) but the kernel's
+			 * per-door ct has since expired → stale. */
+			stale[i] = true;
+			any_stale = true;
+		}
+	}
+
+	if (!any_stale)
+		return;
+
+	spin_lock_bh(&master->lock);
+	for (i = 0; i < WGA_POOL_SIZE; i++) {
+		if (!stale[i])
+			continue;
+		/* Reuse-detection: only zero if the slot is unchanged
+		 * since snapshot.  `wga_help` may have refreshed it
+		 * with a different (ip, port, last_seen) in between. */
+		if (p->slot[i].ip == snapshot[i].ip &&
+		    p->slot[i].port == snapshot[i].port &&
+		    p->slot[i].last_seen_q8 == snapshot[i].last_seen_q8) {
+			memset(&p->slot[i], 0, sizeof(p->slot[i]));
+			atomic_inc(&wga_stat_pool_gc_removed);
+		}
+	}
+	spin_unlock_bh(&master->lock);
+}
+
+/* Returns true if master's pool has at least one filled slot but no
+ * untried init-seed sentinel.  Triggers a one-shot re-seed on the
+ * first outbound packet after a fresh master is promoted (covers the
+ * re-key-to-different-anycast case where the new master starts with
+ * only slot[0] from the RESP and lacks init entries until next
+ * handshake — which would be ≤120 s of reduced diversity). */
+static bool wga_master_is_fresh(struct nf_conn *master)
+{
+	struct wga_pool_inline *p = wga_pool_of(master);
+	int i, occupied = 0;
+	bool has_seed = false, fresh;
+
+	if (!p)
+		return false;
+
+	spin_lock_bh(&master->lock);
+	for (i = 0; i < WGA_POOL_SIZE; i++) {
+		if (p->slot[i].ip == 0)
+			continue;
+		occupied++;
+		if (p->slot[i].last_seen_q8 == 0)
+			has_seed = true;
+	}
+	fresh = (occupied > 0) && !has_seed && (occupied < WGA_POOL_SIZE);
+	spin_unlock_bh(&master->lock);
+	return fresh;
+}
+
+/* Seeding cadence gate.  See plan section 3. */
+static bool wga_should_seed(struct nf_conn *master,
+			    const struct wga_pkt_info *pi,
+			    const struct xt_wganycast_info *info)
+{
+	if (!info || info->ninit == 0)
+		return false;
+
+	/* Trigger 1: outbound handshake (INIT / RESP / COOKIE). */
+	if (pi->wg_type == WG_TYPE_INIT ||
+	    pi->wg_type == WG_TYPE_RESP ||
+	    pi->wg_type == WG_TYPE_COOKIE)
+		return true;
+
+	/* Trigger 2: WG keepalive (DATA with 32-byte total payload =
+	 * header + tag, no plaintext). */
+	if (pi->wg_type == WG_TYPE_DATA &&
+	    pi->wg_payload_len == WGA_KEEPALIVE_WG_PAYLOAD_LEN)
+		return true;
+
+	/* Trigger 3: fresh master needs init-seed catch-up. */
+	return wga_master_is_fresh(master);
+}
+
+/* DATA-spray pick + rewrite with per-door-ct eligibility filter.
+ *
+ *   Eligibility rule per slot:
+ *     - `last_seen_q8 == 0` (untried init seed): always eligible.
+ *       The kernel hasn't seen any TX/RX on this door yet; we'll
+ *       give it a chance and bump `last_seen_q8` to `wga_now_q8()`
+ *       after the spray decides to use it.
+ *     - `last_seen_q8 > 0` (previously tried): query per-door ct.
+ *       ALIVE → eligible.  DEAD or UNKNOWN → not eligible.
+ *
+ *   Empty filter → fall back to unfiltered snapshot.  Better to
+ *   spray to a (possibly-stale) door than to drop the packet.
+ *
+ *   Post-spray bump: if the picked slot was an untried seed
+ *   (snapshot's last_seen_q8 == 0), promote it under lock with
+ *   reuse-detection so it transitions to "tried" for the next
+ *   spray's DATA-filter pass.
+ */
+static bool wga_pick_for_data_and_rewrite(struct sk_buff *skb,
+					  struct iphdr *iph,
+					  struct udphdr *udph,
+					  struct nf_conn *master,
+					  struct net *net)
+{
+	struct wga_pool_inline *p = wga_pool_of(master);
+	struct wga_pool_entry snapshot[WGA_POOL_SIZE];
+	u8 eligible_idx[WGA_POOL_SIZE];
+	u8 occupied_idx[WGA_POOL_SIZE];
+	u8 eligible_n = 0, occupied_n = 0;
+	u8 chosen_slot;
+	struct wga_pool_entry chosen;
+	bool was_seed;
+	int i;
+	u32 pick;
+
+	if (!p)
+		return false;
+
+	spin_lock_bh(&master->lock);
+	memcpy(snapshot, p->slot, sizeof(snapshot));
+	spin_unlock_bh(&master->lock);
+
+	for (i = 0; i < WGA_POOL_SIZE; i++) {
+		if (snapshot[i].ip == 0)
+			continue;
+		occupied_idx[occupied_n++] = (u8)i;
+
+		if (snapshot[i].last_seen_q8 == 0) {
+			eligible_idx[eligible_n++] = (u8)i;
+			continue;
+		}
+		if (wga_query_door(net, iph->saddr, udph->source,
+				   snapshot[i].ip, snapshot[i].port)
+		    == WGA_DOOR_ALIVE) {
+			eligible_idx[eligible_n++] = (u8)i;
+		} else {
+			atomic_inc(&wga_stat_spray_data_filtered);
+		}
+	}
+
+	if (occupied_n == 0)
+		return false;
+
+	if (eligible_n > 0) {
+		pick = get_random_u32_below((u32)eligible_n);
+		chosen_slot = eligible_idx[pick];
+	} else {
+		/* All slots are tried-and-dead; spray anyway and let
+		 * the GC / handshake re-seed correct things.  Beats
+		 * stranding the packet. */
+		pick = get_random_u32_below((u32)occupied_n);
+		chosen_slot = occupied_idx[pick];
+		atomic_inc(&wga_stat_spray_data_fallback);
+	}
+
+	chosen = snapshot[chosen_slot];
+	was_seed = (chosen.last_seen_q8 == 0);
+
+	wga_rewrite_packet(skb, iph, udph, chosen.ip, chosen.port);
+
+	/* Promote untried seed → tried (last_seen_q8 = now).  Re-acquire
+	 * the lock and verify the slot hasn't been reused by wga_help in
+	 * the meantime; only stamp if the (ip, port, last_seen_q8 == 0)
+	 * triple still matches. */
+	if (was_seed) {
+		spin_lock_bh(&master->lock);
+		if (p->slot[chosen_slot].ip == chosen.ip &&
+		    p->slot[chosen_slot].port == chosen.port &&
+		    p->slot[chosen_slot].last_seen_q8 == 0) {
+			p->slot[chosen_slot].last_seen_q8 = wga_now_q8();
+			atomic_inc(&wga_stat_pool_seed_promoted);
+		}
+		spin_unlock_bh(&master->lock);
+	}
+	return true;
 }
 
 /* --------------------------------------------------------------------
@@ -879,26 +1260,44 @@ static unsigned int wganycast_target_v4(struct sk_buff *skb,
 	if (!master) {
 		rcu_read_unlock();
 		/* Cold start — no marker yet.  If the rule carries a
-		 * static init pool, spray from it; otherwise count
+		 * static init pool, spray from it (biased toward known-
+		 * alive doors via per-door cts); otherwise count
 		 * spray_no_master and pass through. */
-		if (wga_pick_init_and_rewrite(skb, iph, udph, info))
+		if (wga_pick_init_and_rewrite(skb, iph, udph, info, net))
 			atomic_inc(&wga_stat_spray_init_rewrote);
 		else
 			atomic_inc(&wga_stat_spray_no_master);
 		return XT_CONTINUE;
 	}
 
-	/* Master exists.  Seed master's inline pool from rule's init
-	 * entries (idempotent LRU insert; harmless re-runs on every
-	 * packet).  Then pick from master's pool — which now contains
-	 * any real-observed doors PLUS init entries until LRU decays
-	 * them. */
-	wga_seed_master_from_init(master, info);
+	/* Master exists.  v10.1 pipeline:
+	 *   1. Pre-spray GC: drop pool slots whose per-door ct has
+	 *      expired (the slot was tried — last_seen_q8 > 0 — but
+	 *      no kernel ct exists anymore).
+	 *   2. Gated seed: only on handshake / keepalive / fresh
+	 *      master.  Avoids the v10.0 "init seed keeps getting
+	 *      re-inserted post-eviction" thrashing.
+	 *   3. Pick + rewrite, with DATA-spray applying a per-door-ct
+	 *      eligibility filter to avoid dead doors.  Handshakes
+	 *      (INIT / RESP / COOKIE) keep using the full-pool random
+	 *      picker since they're meant to probe.
+	 */
+	wga_run_pool_gc(net, master, iph, udph);
 
-	if (wga_pick_and_rewrite(skb, iph, udph, master))
-		atomic_inc(&wga_stat_spray_rewrote);
-	else
-		atomic_inc(&wga_stat_spray_no_rewrite);
+	if (wga_should_seed(master, &pi, info))
+		wga_seed_master_from_init(master, info);
+
+	if (pi.wg_type == WG_TYPE_DATA) {
+		if (wga_pick_for_data_and_rewrite(skb, iph, udph, master, net))
+			atomic_inc(&wga_stat_spray_rewrote);
+		else
+			atomic_inc(&wga_stat_spray_no_rewrite);
+	} else {
+		if (wga_pick_and_rewrite(skb, iph, udph, master))
+			atomic_inc(&wga_stat_spray_rewrote);
+		else
+			atomic_inc(&wga_stat_spray_no_rewrite);
+	}
 	rcu_read_unlock();
 
 	return XT_CONTINUE;
