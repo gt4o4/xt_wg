@@ -44,7 +44,11 @@
 #include <linux/random.h>
 #include <linux/skbuff.h>
 #include <linux/spinlock.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+#include <asm/unaligned.h>
+#else
 #include <linux/unaligned.h>
+#endif
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/netfilter/x_tables.h>
