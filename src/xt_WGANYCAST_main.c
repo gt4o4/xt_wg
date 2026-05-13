@@ -37,9 +37,11 @@
  *     start fallback for CN hubs whose outbound INIT would
  *     otherwise hit a GFW-blocked real IP).  When master DOES
  *     exist, the init entries are also seeded into master's
- *     inline pool via the normal `wga_learn_door` LRU path —
- *     idempotent, so re-running per packet is safe and self-
- *     converges.
+ *     inline pool via `wga_seed_pool_if_absent` (insert-only,
+ *     never refreshes `last_seen_q8` on match — preserves
+ *     seed-then-decay so real-observed RX from `wga_help` can
+ *     LRU-evict unconfirmed init entries once 4 distinct real
+ *     doors exist).
  *
  * Master ct lifetime: bounded above by 200 s via
  * `IPS_FIXED_TIMEOUT_BIT`.  Markers + pool die with master via
