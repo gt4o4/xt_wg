@@ -1,0 +1,51 @@
+# autotools-generated (top level)
+/Makefile
+/Makefile.in
+/aclocal.m4
+/autom4te.cache/
+/build-aux/
+/config.h
+/config.h.in
+/config.h.in~
+/config.log
+/config.status
+/configure
+/configure~
+/libtool
+/m4/
+/stamp-h1
+
+# autotools-generated (src/)
+src/Makefile
+src/Makefile.in
+src/Makefile.libxt
+src/.deps/
+src/.libs/
+
+# build artefacts
+src/*.o
+src/*.ko
+src/*.ko.zst
+src/*.so
+src/*.oo
+src/*.lo
+src/.*.oo.d
+src/.*.cmd
+src/modules.order
+src/Module.symvers
+src/Module.markers
+
+# release tarballs
+/*.tar.xz
+/*.tar.bz2
+
+# debian/ build state (dpkg-buildpackage drops binaries one dir up)
+debian/.debhelper/
+debian/files
+debian/debhelper-build-stamp
+debian/tarball-tmp/
+debian/xt-wg-common/
+debian/xt-wg-source/
+debian/xt-wg-dkms/
+debian/*.substvars
+debian/*.log
