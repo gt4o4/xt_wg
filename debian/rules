@@ -1,0 +1,99 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+include /usr/share/dpkg/pkg-info.mk
+include /usr/share/dpkg/architecture.mk
+
+# DKMS install tree at /usr/src/xt-wg-<UPSTREAM_VERSION>/.  The version
+# must match what debian/xt-wg-dkms.dkms substitutes via #MODULE_VERSION#.
+UPSTREAM_NAME    = xt-wg
+UPSTREAM_VERSION = $(DEB_VERSION_UPSTREAM)
+
+DKMS_TREE        = debian/xt-wg-dkms/usr/src/$(UPSTREAM_NAME)-$(UPSTREAM_VERSION)
+SOURCE_TARBALL   = debian/xt-wg-source/usr/src/$(UPSTREAM_NAME).tar.bz2
+
+# Files copied into both the -source tarball and the -dkms tree.  Listed
+# explicitly (not "cp -a src/") so userspace build artefacts produced by
+# dh_auto_build (libxt_*.so, .libxt_*.oo.d) do not leak into the kernel-
+# module source trees.
+KMOD_TOP_FILES = configure.ac autogen.sh Makefile.am dkms.conf LICENSE README.md
+KMOD_SRC_FILES = \
+    src/Kbuild \
+    src/Makefile.am \
+    src/Makefile.libxt.in \
+    src/chacha.c src/chacha.h \
+    src/wg.h \
+    src/xt_wg_common.h src/xt_wg_main.c \
+    src/xt_WGOBFS.h    src/xt_WGOBFS_main.c    src/libxt_WGOBFS.c \
+    src/xt_WGANYCAST.h src/xt_WGANYCAST_main.c src/libxt_WGANYCAST.c \
+    src/xt_WGPTCP.h    src/xt_WGPTCP_main.c    src/libxt_WGPTCP.c
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	./autogen.sh
+	dh_auto_configure -- --without-kbuild
+
+override_dh_auto_build:
+	$(MAKE) -C src libxt-local
+
+override_dh_auto_test:
+	# upstream has no test suite
+
+override_dh_auto_install:
+	# 1. Userspace iptables plugins -> xt-wg-common.
+	#    src/Makefile.libxt:install does not create its destination
+	#    directory, so pre-create it.  (Upstream Makefile relies on a
+	#    pre-existing system xtables dir from make install over /.)
+	install -d $(CURDIR)/debian/xt-wg-common/usr/lib/$(DEB_HOST_MULTIARCH)/xtables
+	$(MAKE) -C src libxt-install \
+	    DESTDIR=$(CURDIR)/debian/xt-wg-common
+	# 2. Kernel-module source -> xt-wg-dkms (/usr/src/xt-wg-VERSION/).
+	#    dh_dkms (via dh-sequence-dkms) drops dkms.conf alongside.
+	install -d $(DKMS_TREE)/src
+	install -m 0644 $(KMOD_SRC_FILES) $(DKMS_TREE)/src/
+	install -m 0644 $(filter-out autogen.sh,$(KMOD_TOP_FILES)) $(DKMS_TREE)/
+	install -m 0755 autogen.sh $(DKMS_TREE)/
+	# 3. m-a source tarball -> xt-wg-source (/usr/src/xt-wg.tar.bz2).
+	install -d debian/xt-wg-source/usr/src
+	install -d debian/tarball-tmp/modules/$(UPSTREAM_NAME)/src
+	install -m 0644 $(KMOD_SRC_FILES) \
+	    debian/tarball-tmp/modules/$(UPSTREAM_NAME)/src/
+	install -m 0644 $(filter-out autogen.sh,$(KMOD_TOP_FILES)) \
+	    debian/tarball-tmp/modules/$(UPSTREAM_NAME)/
+	install -m 0755 autogen.sh \
+	    debian/tarball-tmp/modules/$(UPSTREAM_NAME)/
+	# Inner debian/ overlay for module-assistant.
+	install -d debian/tarball-tmp/modules/$(UPSTREAM_NAME)/debian
+	install -m 0644 debian/changelog debian/copyright \
+	    debian/control.modules.in \
+	    debian/tarball-tmp/modules/$(UPSTREAM_NAME)/debian/
+	install -m 0755 debian/rules.modules \
+	    debian/tarball-tmp/modules/$(UPSTREAM_NAME)/debian/rules
+	# Reproducible tarball (sorted, fixed owner, fixed mtime).
+	(cd debian/tarball-tmp && \
+	    tar --owner=root --group=root --sort=name \
+	        --mtime="@$(SOURCE_DATE_EPOCH)" \
+	        -cjf $(CURDIR)/$(SOURCE_TARBALL) modules)
+	$(RM) -r debian/tarball-tmp
+
+override_dh_auto_clean:
+	# Upstream Makefile.am's clean hook invokes a kbuild clean even
+	# when configure ran --without-kbuild, which breaks (kbuilddir is
+	# empty -> "make -C "" ..." errors).  Bypass make entirely and
+	# clean autotools / build artefacts by hand.
+	$(RM) -r debian/tarball-tmp autom4te.cache build-aux m4
+	$(RM) -r src/.deps src/.libs
+	$(RM) configure config.h.in config.h config.log config.status aclocal.m4
+	$(RM) Makefile src/Makefile src/Makefile.libxt
+	$(RM) src/*.so src/*.oo src/*.lo
+	find . -name 'Makefile.in' -not -path './src/Makefile.libxt.in' -delete
+
+# Skip dh_dkms's autopkgtest dependency injection — we ship a single
+# kernel module with no Python/Perl helpers, and the default tests add
+# noise without value.  Remove this override if you want them back.
+override_dh_dkms:
+	dh_dkms -V $(UPSTREAM_VERSION)

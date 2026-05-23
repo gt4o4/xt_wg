@@ -67,6 +67,31 @@ make tarball
 sudo make dkms-install
 ```
 
+### Debian / Ubuntu (`.deb`)
+
+The `debian/` tree builds three `.deb` packages via debhelper.
+
+```shell
+sudo apt-get install autoconf automake libtool libxtables-dev pkgconf \
+                     debhelper-compat dh-dkms devscripts fakeroot
+dpkg-buildpackage -us -uc -b
+```
+
+Produces in the parent directory:
+
+- `xt-wg-common_<v>_<arch>.deb` — userspace plugins
+  (`libxt_WG{OBFS,ANYCAST,PTCP}.so`).
+- `xt-wg-source_<v>_all.deb` — drops `/usr/src/xt-wg.tar.bz2` with an
+  inner `debian/` for module-assistant. After install run
+  `sudo m-a a-i xt-wg` to compile a kernel-version-specific
+  `xt-wg-modules-$(uname -r).deb`.
+- `xt-wg-dkms_<v>_all.deb` — kernel-module source for DKMS auto-rebuild.
+  Installing the deb triggers a build for every installed kernel; new
+  kernels rebuild automatically.
+
+Install `xt-wg-common` plus exactly one of `xt-wg-dkms` or the m-a-built
+modules deb — the two kernel-module mechanisms are equivalent.
+
 Tested on Alpine 5.15, CentOS 7, Debian 10-13, openSUSE 15.5.
 
 

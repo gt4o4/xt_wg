@@ -1,0 +1,50 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+#
+# module-assistant rules.  Extracted from /usr/src/xt-wg.tar.bz2 by m-a
+# into /usr/src/modules/xt-wg/debian/rules, then invoked as:
+#
+#   debian/rules kdist_config KVERS=$(uname -r) KSRC=/lib/modules/$(uname -r)/build
+#   debian/rules binary-modules
+#
+# Produces xt-wg-modules-$(KVERS)_<UPSTREAM>_<arch>.deb under the parent
+# directory.
+
+# Kbuild invocation against the consolidated src/Kbuild.
+MAKEARGS = -C $(KSRC) M=$(CURDIR)/src
+
+-include /usr/share/modass/include/generic.make
+-include /usr/share/modass/include/common-rules.make
+
+PACKAGE = xt-wg-modules
+
+%:
+	dh $@
+
+kdist_clean: | debian/control
+	dh clean
+
+kdist_config: prep-deb-files
+
+binary-modules:
+	dh binary-arch
+
+override_dh_auto_configure:
+	./autogen.sh
+	dh_auto_configure -- --with-kbuild=$(KSRC)
+
+override_dh_auto_build:
+	$(MAKE) $(MAKEARGS) modules
+
+override_dh_auto_install:
+	$(MAKE) $(MAKEARGS) modules_install \
+	    INSTALL_MOD_PATH=$(CURDIR)/debian/$(PKGNAME) \
+	    INSTALL_MOD_DIR=extra/xt-wg \
+	    DEPMOD=/bin/true
+
+override_dh_auto_clean:
+	$(MAKE) $(MAKEARGS) clean
+	[ ! -f Makefile ] || $(MAKE) distclean
+
+override_dh_clean:
+	dh_clean $(patsubst %.modules.in,%,$(wildcard debian/*.modules.in))

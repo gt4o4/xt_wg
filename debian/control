@@ -1,0 +1,85 @@
+Source: xt-wg
+Section: net
+Priority: optional
+Maintainer: Bingchen Gong <gongbingchen@gmail.com>
+Build-Depends:
+ autoconf,
+ automake,
+ debhelper-compat (= 13),
+ dh-sequence-dkms,
+ libtool,
+ libxtables-dev,
+ pkgconf,
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/infinet/xt_wgobfs
+Vcs-Browser: https://github.com/infinet/xt_wgobfs
+Vcs-Git: https://github.com/infinet/xt_wgobfs.git
+
+Package: xt-wg-common
+Architecture: any
+Multi-Arch: foreign
+Depends:
+ iptables,
+ ${misc:Depends},
+ ${shlibs:Depends},
+Recommends:
+ xt-wg-dkms | xt-wg-source,
+Description: xtables WireGuard helpers [userspace iptables plugins]
+ Three xtables targets for running WireGuard across hostile or asymmetric
+ networks, shipped together as a single consolidated xt_wg.ko kernel
+ module plus three userspace iptables plugins:
+ .
+   * WGOBFS    - chacha-keyed payload obfuscation; DPI cannot fingerprint
+                 the WireGuard message shape.
+   * WGANYCAST - WG-protocol-aware dynamic anycast pool learning with
+                 per-packet outbound spray.
+   * WGPTCP    - UDP-to-fake-TCP transmutation with stateful tracking
+                 via the kernel's conntrack accounting, so middleboxes
+                 that block or rate-limit UDP let the flow through.
+ .
+ This package provides only the userspace iptables plugins
+ (libxt_WGOBFS.so, libxt_WGANYCAST.so, libxt_WGPTCP.so).  The matching
+ xt_wg.ko kernel module must be built and installed separately via the
+ xt-wg-dkms or xt-wg-source package.
+
+Package: xt-wg-source
+Architecture: all
+Multi-Arch: foreign
+Depends:
+ bzip2,
+ debhelper-compat (= 13),
+ module-assistant (>= 0.11.14~),
+ ${misc:Depends},
+Recommends:
+ xt-wg-common (>= ${source:Version}),
+Description: xtables WireGuard helpers [kernel module source for module-assistant]
+ Source tarball of the xt_wg.ko kernel module, intended for use with
+ module-assistant.  After installing this package, run
+ .
+   m-a a-i xt-wg
+ .
+ to compile and install a kernel-version-specific binary package named
+ xt-wg-modules-$(uname -r).
+ .
+ Kernel headers (linux-headers-$(uname -r)) are required to compile.
+ The xt-wg-common package is also required to use the resulting kernel
+ module.
+
+Package: xt-wg-dkms
+Section: kernel
+Architecture: all
+Multi-Arch: foreign
+Depends:
+ dkms,
+ ${misc:Depends},
+Recommends:
+ xt-wg-common (>= ${source:Version}),
+Description: xtables WireGuard helpers [kernel module source for DKMS]
+ Source of the xt_wg.ko kernel module, managed by DKMS so that the
+ module is automatically rebuilt for each kernel installed on the
+ system.  No manual step is needed after install.
+ .
+ Kernel headers (linux-headers-$(uname -r)) must be available so DKMS
+ can build the module.  The xt-wg-common package is also required to
+ use the resulting kernel module.

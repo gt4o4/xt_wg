@@ -1,0 +1,10 @@
+xt-wg (0.6.2) unstable; urgency=medium
+
+  * Initial Debian packaging modelled on xtables-addons.
+    - xt-wg-common: userspace iptables plugins (libxt_WGOBFS.so,
+      libxt_WGANYCAST.so, libxt_WGPTCP.so).
+    - xt-wg-source: kernel-module source tarball for use with
+      module-assistant ("m-a a-i xt-wg").
+    - xt-wg-dkms: kernel-module source for DKMS auto-rebuild.
+
+ -- Bingchen Gong <gongbingchen@gmail.com>  Sun, 24 May 2026 00:00:00 +0000

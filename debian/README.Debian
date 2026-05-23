@@ -1,0 +1,28 @@
+xt-wg for Debian
+================
+
+The source package builds three binaries:
+
+  xt-wg-common   userspace iptables plugins (libxt_WG{OBFS,ANYCAST,PTCP}.so)
+  xt-wg-source   kernel-module source for module-assistant
+  xt-wg-dkms     kernel-module source for DKMS auto-rebuild
+
+You almost always want xt-wg-common plus exactly one of xt-wg-dkms or
+xt-wg-source.  They produce equivalent kernel modules via different
+mechanisms.
+
+  - xt-wg-dkms is set-and-forget: DKMS rebuilds xt_wg.ko automatically
+    every time a new kernel is installed.  Requires linux-headers for
+    each kernel.
+
+  - xt-wg-source uses module-assistant.  Manual one-shot build per
+    kernel: "m-a a-i xt-wg" produces an xt-wg-modules-$(uname -r)_*.deb.
+    Useful when DKMS is unavailable or undesirable.
+
+The kernel module ships as a single consolidated xt_wg.ko containing all
+three xtables targets (WGOBFS, WGANYCAST, WGPTCP).  Module aliases mean
+"modprobe xt_WGOBFS" / "modprobe xt_WGANYCAST" / "modprobe xt_WGPTCP"
+still resolve to xt_wg.ko, so existing iptables auto-load behaviour and
+/etc/modules-load.d entries keep working.
+
+ -- Bingchen Gong <gongbingchen@gmail.com>
