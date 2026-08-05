@@ -6,8 +6,9 @@
  * targets:
  *
  *   - WGOBFS    — chacha-keyed payload obfuscation
- *   - WGANYCAST — WG-protocol-aware dynamic anycast pool learning,
- *                 conntrack-as-registry (LEARN / SPRAY)
+ *   - WGANYCAST — RETIRED 2026-07-27, no longer compiled (its
+ *                 nf_conntrack_helper_register() does not build on Linux
+ *                 7.1+; the source stays in-tree for forensics only)
  *   - WGPTCP    — WG-protocol-aware UDP↔fake-TCP transmutation
  *
  * Each target's xt_target[] array lives in its own translation unit
@@ -48,14 +49,6 @@ static int __init xt_wg_init(void)
 	if (rc)
 		return rc;
 
-	rc = xt_wganycast_module_init();
-	if (rc)
-		goto err_anycast_helper;
-
-	rc = xt_register_targets(xt_wganycast_targets, xt_wganycast_targets_n);
-	if (rc)
-		goto err_anycast_target;
-
 	rc = xt_register_targets(xt_wgptcp_targets, xt_wgptcp_targets_n);
 	if (rc)
 		goto err_ptcp;
@@ -63,10 +56,6 @@ static int __init xt_wg_init(void)
 	return 0;
 
 err_ptcp:
-	xt_unregister_targets(xt_wganycast_targets, xt_wganycast_targets_n);
-err_anycast_target:
-	xt_wganycast_module_exit();
-err_anycast_helper:
 	xt_unregister_targets(xt_wgobfs_targets, xt_wgobfs_targets_n);
 	return rc;
 }
@@ -74,8 +63,6 @@ err_anycast_helper:
 static void __exit xt_wg_exit(void)
 {
 	xt_unregister_targets(xt_wgptcp_targets, xt_wgptcp_targets_n);
-	xt_unregister_targets(xt_wganycast_targets, xt_wganycast_targets_n);
-	xt_wganycast_module_exit();
 	xt_unregister_targets(xt_wgobfs_targets, xt_wgobfs_targets_n);
 }
 
@@ -83,7 +70,7 @@ module_init(xt_wg_init);
 module_exit(xt_wg_exit);
 
 MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("xtables WireGuard helpers: WGOBFS + WGANYCAST + WGPTCP");
+MODULE_DESCRIPTION("xtables WireGuard helpers: WGOBFS + WGPTCP");
 MODULE_AUTHOR("Wei Chen <weichen302@gmail.com>");
 MODULE_AUTHOR("Bingchen Gong <gongbingchen@gmail.com>");
 MODULE_VERSION("0.7.0");
@@ -96,7 +83,5 @@ MODULE_VERSION("0.7.0");
 MODULE_ALIAS("xt_WGOBFS");
 MODULE_ALIAS("ipt_WGOBFS");
 MODULE_ALIAS("ip6t_WGOBFS");
-MODULE_ALIAS("xt_WGANYCAST");
-MODULE_ALIAS("ipt_WGANYCAST");
 MODULE_ALIAS("xt_WGPTCP");
 MODULE_ALIAS("ipt_WGPTCP");

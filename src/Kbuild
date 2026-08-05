@@ -3,4 +3,9 @@
 # chacha.o + wg.h.  Per-target MODULE_ALIASes in xt_wg_main.c keep
 # `modprobe xt_WGOBFS` / `xt_WGANYCAST` / `xt_WGPTCP` working.
 obj-m += xt_wg.o
-xt_wg-y += xt_wg_main.o xt_WGOBFS_main.o xt_WGANYCAST_main.o xt_WGPTCP_main.o chacha.o
+# WGANYCAST is RETIRED (2026-07-27) and is no longer compiled: its
+# nf_conntrack_helper_register() call does not build on Linux 7.1+, which
+# gained a second (output) argument. The source is kept in-tree for the
+# conntrack-helper/expectation forensics it documents, but nothing loads
+# the target any more. WGOBFS is stateless and touches no conntrack API.
+xt_wg-y += xt_wg_main.o xt_WGOBFS_main.o xt_WGPTCP_main.o chacha.o
